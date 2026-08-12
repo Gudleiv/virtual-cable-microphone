@@ -54,17 +54,30 @@ configuration, which is what the later stages are configured from.
 ## Requirements
 
 - Windows 10/11
-- Visual Studio 2022 (MSVC v143) with the Windows SDK, or the Build Tools
+- Visual Studio 2022 or newer with the Windows SDK, or the Build Tools
+  (verified with Visual Studio Community 2026, MSVC 19.51, toolset v180)
 - CMake 3.21+
 - VB-CABLE A+B installed, for stage 2 onward
 
-No third-party libraries. Only the Windows SDK.
+No third-party libraries. Only the Windows SDK. Windows only: WASAPI has no
+counterpart under WSL, and the CMake configure step refuses to run there.
 
 ## Build
 
 ```powershell
-cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake -B build -A x64
 cmake --build build --config Release
+```
+
+Leaving `-G` off lets CMake pick the newest Visual Studio generator that is
+actually installed, which avoids `MSB8020` when a specific toolset is not
+present. Name it explicitly only if several versions are installed side by side
+(`-G "Visual Studio 18 2026"`, `-G "Visual Studio 17 2022"`, ...).
+
+If `cmake` is not on `PATH`, Visual Studio ships one:
+
+```powershell
+$env:PATH = "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;$env:PATH"
 ```
 
 The executable lands in `build\bin\Release\vcmic.exe` (`build\bin\vcmic.exe` for
@@ -88,18 +101,31 @@ Exit codes: `0` success, `1` bad command line, `2` failure.
 
 ### Setting it up
 
+`config.toml` in the repository root is already filled in for this machine from
+the survey in [`docs/devices-2026-08-12.md`](docs/devices-2026-08-12.md), so the
+check is just:
+
+```powershell
+build\bin\Release\vcmic.exe --check-config --config config.toml
+```
+
+`--config` takes a path relative to the current directory; without it, vcmic
+reads `config.toml` next to the executable.
+
+To redo the survey after a hardware change:
+
 1. `vcmic --list-devices > devices.txt` and find the three endpoints:
-   - the GC7 render endpoint Discord plays into (usually the Default
-     Communications Device — the `Headset`),
-   - the GC7 microphone,
-   - `CABLE-A Input` (the **render** side of the cable).
+   - the GC7 render endpoint Discord plays into (the Default Communications
+     Device — `Наушники гарнитуры`),
+   - the microphone Discord records from,
+   - `CABLE-A Input` (the **render** side of the cable, not `CABLE-A In 16ch`).
 
    Every endpoint is listed with its state, so devices that Windows currently
    hides also show up.
 
-2. Copy `config.example.toml` to `config.toml` next to `vcmic.exe` and paste the
-   three ids in. The bottom of the `--list-devices` output contains a guessed
-   `[devices]` block you can start from — check it rather than trust it.
+2. Paste the ids into `config.toml`. The bottom of the `--list-devices` output
+   contains a guessed `[devices]` block to start from — check it rather than
+   trust it. `config.example.toml` documents every available setting.
 
 3. `vcmic --check-config` — it resolves each device, prints what it found and
    verifies that all three run at 48 kHz.

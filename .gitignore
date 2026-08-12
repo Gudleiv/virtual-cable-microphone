@@ -68,5 +68,5 @@ vcpkg_installed/
 Testing/
 .cache/
 
-# User-specific configuration (start from config.example.toml)
-config.toml
+# config.toml is tracked on purpose: this is a single-machine tool and the
+# endpoint ids in it are the result of a device survey worth keeping.

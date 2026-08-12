@@ -1,0 +1,53 @@
+# vcmic configuration for this machine.
+#
+# Filled in from `vcmic --list-devices` (see docs/devices-2026-08-12.md).
+# config.example.toml has the full annotated list of every setting; only the
+# device ids and anything deliberately non-default are repeated here.
+
+[devices]
+
+# Наушники гарнитуры (Sound Blaster GC7) - ACTIVE, Default Communications
+# Device, so this is where Discord plays. Captured with WASAPI loopback.
+# 48000 Hz, 2 ch, float32.
+chat_render_id = "{0.0.0.00000000}.{d08ae5da-995b-4f0e-8adb-ac19ddc87bf0}"
+chat_render_name = "Наушники гарнитуры (Sound Blaster GC7)"
+
+# Микрофон (4- fifine Microphone) - ACTIVE, and the default for Console,
+# Multimedia and Communications, so this is the microphone Discord uses.
+# 48000 Hz, 2 ch, float32 - already stereo, no mono duplication needed.
+#
+# Note: "Микрофон (Sound Blaster GC7)" exists but is DISABLED in Windows, so
+# the GC7's own microphone input is not an option right now.
+#
+# The "4-" prefix means Windows has seen this fifine on four different USB
+# ports; moving it to another port mints a new endpoint id and the id below
+# stops resolving. The name fallback catches that: only one fifine endpoint is
+# ever ACTIVE at a time, so matching on "fifine" lands on the right one.
+mic_capture_id = "{0.0.1.00000000}.{07e3bc09-e84c-412f-a7bd-290bca23d211}"
+mic_capture_name = "fifine"
+
+# CABLE-A Input (VB-Audio Virtual Cable A) - the render side of cable A.
+# 48000 Hz, 2 ch, float32, minimum device period 2 ms.
+#
+# Do not confuse it with "CABLE-A In 16ch", which is a second render endpoint
+# of the same driver. ShadowPlay must be pointed at the capture side,
+# "CABLE-A Output" {0.0.1.00000000}.{a789742f-ab35-41b1-b651-1c86c68a1787}.
+output_render_id = "{0.0.0.00000000}.{4367dfca-8893-49ed-80fd-c740a21c9cb9}"
+output_render_name = "CABLE-A Input"
+
+[audio]
+# All three endpoints report 48000 Hz, so the strict check can stay on.
+sample_rate = 48000
+require_sample_rate = true
+target_buffer_ms = 25.0
+ring_capacity_ms = 250.0
+
+[mix]
+# Start flat and adjust after the first test call.
+chat_gain_db = 0.0
+mic_gain_db = 0.0
+limiter_enabled = true
+
+[log]
+level = "info"
+file = "vcmic.log"
