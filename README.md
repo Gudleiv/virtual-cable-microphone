@@ -43,13 +43,18 @@ The full specification is in [`docs/gc7-virtual-mic-spec.md`](docs/gc7-virtual-m
 | Stage | Contents | State |
 |---|---|---|
 | 1 | project skeleton, `--list-devices`, config parser, logging | **done** |
-| 2 | three streams, lock-free SPSC rings, mixing | not started |
-| 3 | drift compensation, limiter, counters | not started |
+| 2 | three streams, lock-free SPSC rings, mixing | **done** |
+| 3 | drift compensation, limiter, noise gate | not started |
 | 4 | `IMMNotificationClient`, device-invalidation recovery, backoff | not started |
 | 5 | tray icon, autostart | not started |
 
-Stage 1 does not move any audio yet. It identifies devices and validates the
-configuration, which is what the later stages are configured from.
+Running `vcmic` with no mode option now mixes chat and microphone into the
+cable until Ctrl+C. What is still missing is drift compensation: the three
+endpoints run on three independent clocks, and without correction the ring fill
+level walks away until the resync valve drops a backlog — one audible glitch
+every ten to twenty minutes at a typical 100 ppm mismatch. Stage 3 fixes that.
+See [`docs/testing-notes.md`](docs/testing-notes.md) for what has been measured
+and what has not.
 
 ## Requirements
 
@@ -88,6 +93,7 @@ by default, so no redistributable is needed; pass
 ## Usage
 
 ```
+vcmic                    run the mixer until Ctrl+C
 vcmic --list-devices     list every audio endpoint with id, roles and mix format
 vcmic --active-only ...  with --list-devices: hide disabled/unplugged endpoints
 vcmic --check-config     resolve the configured devices and validate formats
@@ -98,6 +104,35 @@ vcmic --help
 ```
 
 Exit codes: `0` success, `1` bad command line, `2` failure.
+
+While running, vcmic logs a counter report every `log.stats_interval_s`
+seconds: the fill level of each ring, plus underruns, overruns, resyncs,
+discontinuities and clipped samples. A healthy session shows a fill level near
+`audio.target_buffer_ms` and zeros everywhere else.
+
+## How the audio path works
+
+Three threads, and the render side owns the clock:
+
+- **Chat capture** — WASAPI loopback on the endpoint Discord plays into,
+  polled from its own thread with a high-resolution waitable timer. Loopback is
+  unreliable with an event callback in shared mode, hence polling. Reading a
+  copy of that stream does not disturb Discord or add latency to it.
+- **Microphone capture** — ordinary shared-mode capture, polled the same way,
+  never exclusive, so Discord keeps the microphone open at the same time.
+- **Cable render** — event-driven and the clock master. Every event it pulls
+  what both rings have, mixes, and hands the result to WASAPI.
+
+Between them sit two lock-free single-producer/single-consumer rings of
+deinterleaved float32. Nothing in the audio path allocates, locks or logs;
+threads run under MMCSS "Pro Audio", and counters are plain relaxed atomics
+that a low-priority thread reports.
+
+Each source is held silent until its ring reaches `audio.target_buffer_ms`, so
+the steady-state latency is what the config asks for rather than whatever the
+startup race produces. A source that stalls goes back to refilling, and a
+backlog past four times the target is dropped rather than carried as permanent
+latency.
 
 ### Setting it up
 

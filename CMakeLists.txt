@@ -23,6 +23,7 @@ endif()
 
 add_executable(vcmic
     src/main.cpp
+    src/audio_engine.cpp
     src/audio_format.cpp
     src/config.cpp
     src/console.cpp
@@ -30,6 +31,7 @@ add_executable(vcmic
     src/hresult.cpp
     src/logging.cpp
     src/paths.cpp
+    src/sample_convert.cpp
     src/strings.cpp
 )
 

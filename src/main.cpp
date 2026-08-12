@@ -1,3 +1,4 @@
+#include "audio_engine.h"
 #include "audio_format.h"
 #include "com.h"
 #include "config.h"
@@ -35,6 +36,8 @@ void PrintUsage() {
     PrintLine(L"{} {} - {}", kAppName, kAppVersion, kAppSummary);
     PrintLine();
     PrintLine(L"Usage: vcmic [options]");
+    PrintLine();
+    PrintLine(L"With no mode option, vcmic runs the mixer until Ctrl+C.");
     PrintLine();
     PrintLine(L"  -l, --list-devices     list every audio endpoint with id, roles and mix format");
     PrintLine(L"      --active-only      with --list-devices: hide disabled/unplugged endpoints");
@@ -343,6 +346,61 @@ int RunCheckConfig(const Config& config, const std::filesystem::path& config_pat
     return ok ? kExitOk : kExitFailure;
 }
 
+// Signalled by the console control handler and by AudioEngine::Stop().
+HANDLE g_stop_event = nullptr;
+
+BOOL WINAPI ConsoleControlHandler(DWORD type) {
+    switch (type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            if (g_stop_event != nullptr) {
+                ::SetEvent(g_stop_event);
+            }
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+int RunEngine(const Config& config) {
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CreateDeviceEnumerator(enumerator);
+    if (FAILED(hr)) {
+        LogError(L"cannot create the device enumerator: {}", FormatHresult(hr));
+        return kExitFailure;
+    }
+
+    g_stop_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_stop_event == nullptr) {
+        LogError(L"CreateEvent failed: {}", FormatHresult(HRESULT_FROM_WIN32(::GetLastError())));
+        return kExitFailure;
+    }
+    ::SetConsoleCtrlHandler(ConsoleControlHandler, TRUE);
+
+    int exit_code = kExitOk;
+    {
+        AudioEngine engine;
+        std::wstring error;
+        hr = engine.Start(enumerator.Get(), config, error);
+        if (FAILED(hr)) {
+            LogError(L"{}", error);
+            exit_code = kExitFailure;
+        } else {
+            engine.Run(g_stop_event, config.log.stats_interval_s);
+            engine.Stop();
+            engine.LogSummary();
+        }
+    }
+
+    ::SetConsoleCtrlHandler(ConsoleControlHandler, FALSE);
+    ::CloseHandle(g_stop_event);
+    g_stop_event = nullptr;
+    return exit_code;
+}
+
 int Run(int argc, wchar_t** argv) {
     ConsoleInit();
 
@@ -394,22 +452,31 @@ int Run(int argc, wchar_t** argv) {
     LogSettings log_settings;
     log_settings.file = ResolveRelativeToExe(loaded.config.log.file);
     log_settings.level = loaded.config.log.level;
-    log_settings.console = false;  // the console output below is the report
+    // --check-config prints its own report, so the log stays file-only there.
+    log_settings.console = options.check_config ? false : loaded.config.log.console;
     log_settings.max_bytes = loaded.config.log.max_bytes;
     log_settings.keep_files = loaded.config.log.keep_files;
     Logger::Init(log_settings);
     LogInfo(L"{} {} starting ({})", kAppName, kAppVersion,
-            options.check_config ? L"--check-config" : L"no mode selected");
+            options.check_config ? L"--check-config" : L"mixer");
 
     int exit_code = kExitOk;
     if (options.check_config) {
         exit_code = RunCheckConfig(loaded.config, config_path, loaded.file_exists);
         PrintLine(L"log file    : {}", log_settings.file.wstring());
     } else {
-        PrintUsage();
-        PrintLine();
-        PrintLine(L"The mixing engine is not implemented yet (stage 2).");
-        PrintLine(L"Start with --list-devices, then fill config.toml and run --check-config.");
+        std::vector<std::wstring> engine_errors;
+        ValidateForEngine(loaded.config, engine_errors);
+        if (!engine_errors.empty()) {
+            for (const std::wstring& message : engine_errors) {
+                LogError(L"{}", message);
+            }
+            exit_code = kExitFailure;
+        } else {
+            LogInfo(L"config: {}", config_path.wstring());
+            LogInfo(L"log   : {}", log_settings.file.wstring());
+            exit_code = RunEngine(loaded.config);
+        }
     }
 
     LogInfo(L"exiting with code {}", exit_code);
