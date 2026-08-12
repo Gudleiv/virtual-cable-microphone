@@ -67,3 +67,6 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# User-specific configuration (start from config.example.toml)
+config.toml

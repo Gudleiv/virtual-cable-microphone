@@ -1,0 +1,102 @@
+# vcmic configuration.
+#
+# Copy this file to config.toml next to vcmic.exe and fill in the device ids.
+# Run `vcmic --list-devices` to get them, then `vcmic --check-config` to verify.
+#
+# Syntax: a small TOML subset - [sections], `key = value`, `#` or `;` comments,
+# quoted or bare values. No arrays and no nested tables.
+
+[devices]
+# Endpoint ids are the only stable identity: friendly names are localized and
+# change when the device is re-enumerated. Copy them verbatim, braces included.
+
+# Render endpoint that Discord plays into - the GC7 chat side, usually the
+# Default Communications Device. We capture it with WASAPI loopback, which does
+# not touch Discord's own path and adds no latency to it.
+chat_render_id = ""
+
+# Hardware microphone, opened in shared mode so Discord can keep using it.
+mic_capture_id = ""
+
+# VB-CABLE A *input* (render) endpoint. ShadowPlay then records the matching
+# CABLE-A *Output* (capture) endpoint as its microphone.
+output_render_id = ""
+
+# Optional fallbacks: case-insensitive substring of the friendly name, used only
+# when the id above is empty or no longer resolves. Matching by name logs a
+# warning on every start, so treat these as a safety net rather than a setting.
+chat_render_name = ""
+mic_capture_name = ""
+output_render_name = ""
+
+[audio]
+# All three endpoints must agree on this rate. There is no resampler yet, so a
+# mismatch is a hard error; fix it in VBCABLE_ControlPanel.exe (Internal Sample
+# Rate) and in the Windows device properties (Advanced -> Default Format).
+sample_rate = 48000
+require_sample_rate = true
+
+# Steady-state fill level of each capture ring, in milliseconds. This is the
+# dominant part of the added latency; drift correction pulls the fill level back
+# to this target. Lower is tighter but less tolerant of scheduling hiccups.
+target_buffer_ms = 25.0
+
+# Total ring size. Keep it at several times target_buffer_ms so a scheduling
+# stall costs a bit of latency rather than an overrun.
+ring_capacity_ms = 250.0
+
+[mix]
+# Level of each source in the mixed virtual microphone, in dB.
+chat_gain_db = 0.0
+mic_gain_db = 0.0
+
+# Gain changes ramp over this time instead of stepping, to avoid clicks.
+gain_smoothing_ms = 10.0
+
+# Peak limiter on the sum, so that both of you talking at once cannot clip.
+limiter_enabled = true
+limiter_threshold_db = -1.0
+limiter_release_ms = 80.0
+
+[gate]
+# Optional noise gate on the microphone only. Off by default.
+enabled = false
+threshold_db = -45.0
+attack_ms = 5.0
+hold_ms = 120.0
+release_ms = 150.0
+
+[drift]
+# The three endpoints run on three independent clocks. At 100 ppm that is about
+# 360 ms of skew per hour, so correction is on by default: the read rate is
+# nudged by at most max_rate_correction (0.001 = 0.1 %) to hold the ring at
+# target_buffer_ms. Hard drops and inserts stay as an emergency fallback and are
+# always logged.
+enabled = true
+measure_window_s = 1.0
+max_rate_correction = 0.001
+
+[resilience]
+# A USB DAC re-enumerates on sleep/wake and on replug. Each stream is rebuilt on
+# its own with exponential backoff between these bounds, while the render side
+# keeps running on silence so ShadowPlay never sees a gap.
+backoff_min_ms = 100
+backoff_max_ms = 5000
+
+# Hold a silent render client open on the chat endpoint so its clock keeps
+# running even when nobody is talking. Try this if loopback capture stalls.
+keep_chat_clock_alive = false
+
+[log]
+# trace|debug|info|warn|error|off
+level = "info"
+
+# Relative paths resolve next to vcmic.exe, not to the working directory.
+file = "vcmic.log"
+max_bytes = 2097152
+keep_files = 3
+console = true
+
+# How often the ring fill levels, drift correction and error counters are
+# summarised in the log. 0 disables the periodic report.
+stats_interval_s = 30
