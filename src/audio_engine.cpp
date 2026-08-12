@@ -3,7 +3,6 @@
 #include <avrt.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <format>
 
@@ -66,17 +65,6 @@ double FramesToMs(std::uint64_t frames, std::uint32_t rate) {
 std::size_t MsToFrames(double ms, std::uint32_t rate) {
     const double frames = ms * static_cast<double>(rate) / 1000.0;
     return frames <= 0.0 ? 0 : static_cast<std::size_t>(frames);
-}
-
-float GainFromDb(double db) { return static_cast<float>(std::pow(10.0, db / 20.0)); }
-
-// One-pole coefficient reaching ~63 % of a gain change in `ms` (spec 4.7).
-float SmoothingCoefficient(double ms, std::uint32_t rate) {
-    if (ms <= 0.0 || rate == 0) {
-        return 1.0f;
-    }
-    const double samples = ms * static_cast<double>(rate) / 1000.0;
-    return static_cast<float>(1.0 - std::exp(-1.0 / samples));
 }
 
 std::wstring DescribeEndpoint(const EndpointInfo& info) {
@@ -410,10 +398,6 @@ HRESULT RenderSink::Open(IMMDeviceEnumerator* enumerator, const DeviceSelector& 
         return hr;
     }
 
-    chat_left_.assign(buffer_frames_, 0.0f);
-    chat_right_.assign(buffer_frames_, 0.0f);
-    mic_left_.assign(buffer_frames_, 0.0f);
-    mic_right_.assign(buffer_frames_, 0.0f);
     out_left_.assign(buffer_frames_, 0.0f);
     out_right_.assign(buffer_frames_, 0.0f);
 
@@ -430,10 +414,11 @@ void RenderSink::Close() {
     }
 }
 
-void RenderSink::Bind(CaptureSource& chat, CaptureSource& mic, const AudioConfig& audio,
-                      const MixConfig& mix) {
+void RenderSink::Bind(CaptureSource& chat, CaptureSource& mic, const Config& config) {
     const std::uint32_t rate = format_.sample_rate;
-    const std::size_t target = MsToFrames(audio.target_buffer_ms, rate);
+    const std::size_t target = MsToFrames(config.audio.target_buffer_ms, rate);
+
+    inv_rate_ = rate == 0 ? 0.0 : 1.0 / static_cast<double>(rate);
 
     const auto bind_one = [&](SourceState& state, CaptureSource& source, double gain_db) {
         state.ring = &source.ring();
@@ -446,11 +431,32 @@ void RenderSink::Bind(CaptureSource& chat, CaptureSource& mic, const AudioConfig
         state.max_frames = (std::max)(state.max_frames, state.target_frames + 1);
         state.gain_target = GainFromDb(gain_db);
         state.gain_current = state.gain_target;
+
+        state.drift_enabled = config.drift.enabled && config.drift.max_rate_correction > 0.0;
+        state.drift.Configure(static_cast<double>(state.target_frames), rate, config.drift);
+
+        // The resampler may ask for more input frames than it produces output
+        // frames. Size its input for the largest block WASAPI can hand us at
+        // the fastest read rate the controller is allowed to reach, using the
+        // same integer arithmetic the resampler itself uses.
+        const std::uint64_t fastest =
+            StereoResampler::StepFromRatio(1.0 + state.drift.max_correction());
+        const std::uint64_t worst =
+            ((StereoResampler::kOne - 1) + static_cast<std::uint64_t>(buffer_frames_) * fastest) >>
+            32;
+        state.in_left.assign(static_cast<std::size_t>(worst) + 1, 0.0f);
+        state.in_right.assign(static_cast<std::size_t>(worst) + 1, 0.0f);
+        state.left.assign(buffer_frames_, 0.0f);
+        state.right.assign(buffer_frames_, 0.0f);
+        state.resampler.Reset();
     };
 
-    bind_one(chat_, chat, mix.chat_gain_db);
-    bind_one(mic_, mic, mix.mic_gain_db);
-    gain_coeff_ = SmoothingCoefficient(mix.gain_smoothing_ms, rate);
+    bind_one(chat_, chat, config.mix.chat_gain_db);
+    bind_one(mic_, mic, config.mix.mic_gain_db);
+    gain_coeff_ = SmoothingCoefficient(config.mix.gain_smoothing_ms, rate);
+
+    gate_.Configure(config.gate, rate);
+    limiter_.Configure(config.mix, rate);
 }
 
 bool RenderSink::StartThread(HANDLE stop_event) {
@@ -467,8 +473,10 @@ void RenderSink::JoinThread() {
     }
 }
 
-void RenderSink::PullSource(SourceState& state, std::size_t frames, float* left,
-                            float* right) noexcept {
+void RenderSink::PullSource(SourceState& state, std::size_t frames) noexcept {
+    float* left = state.left.data();
+    float* right = state.right.data();
+
     const std::size_t available = state.ring->Readable();
     state.stats->fill_frames.store(static_cast<std::uint32_t>(available),
                                    std::memory_order_relaxed);
@@ -483,38 +491,86 @@ void RenderSink::PullSource(SourceState& state, std::size_t frames, float* left,
             return;
         }
         state.primed = true;
+        state.resampler.Reset();
+        // The clock ratio the controller learned is still valid; only the
+        // averaged fill describes a moment that has passed.
+        state.drift.Resume(static_cast<double>(available));
         state.stats->primings.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Emergency path of spec 4.6: a backlog this large is a stall that already
-    // happened, and keeping it would just add permanent latency.
+    // happened, and keeping it would just add permanent latency. Drift
+    // correction is a micro-adjustment and cannot dig out of it.
     if (available > state.max_frames) {
         const std::size_t dropped = state.ring->Discard(available - state.target_frames);
         if (dropped > 0) {
             state.stats->resyncs.fetch_add(1, std::memory_order_relaxed);
             state.stats->resync_frames.fetch_add(dropped, std::memory_order_relaxed);
+            state.drift.Resume(static_cast<double>(state.target_frames));
         }
     }
 
-    const std::size_t taken = state.ring->Read(left, right, frames);
-    if (taken < frames) {
-        const std::size_t missing = frames - taken;
-        std::memset(left + taken, 0, missing * sizeof(float));
-        std::memset(right + taken, 0, missing * sizeof(float));
+    if (!state.drift_enabled) {
+        const std::size_t taken = state.ring->Read(left, right, frames);
+        if (taken < frames) {
+            const std::size_t missing = frames - taken;
+            std::memset(left + taken, 0, missing * sizeof(float));
+            std::memset(right + taken, 0, missing * sizeof(float));
+            state.stats->underruns.fetch_add(1, std::memory_order_relaxed);
+            state.stats->underrun_frames.fetch_add(missing, std::memory_order_relaxed);
+            state.primed = false;  // refill to the target before consuming again
+        }
+        return;
+    }
+
+    // Spec 4.6: hold the ring on its target by reading it slightly faster or
+    // slower than the cable plays, rather than by dropping and inserting.
+    state.drift.Update(static_cast<double>(state.ring->Readable()),
+                       static_cast<double>(frames) * inv_rate_);
+    const std::uint64_t step = StereoResampler::StepFromRatio(state.drift.ratio());
+    const std::size_t needed = state.resampler.InputFramesNeeded(frames, step);
+
+    float* in_left = state.in_left.data();
+    float* in_right = state.in_right.data();
+    const std::size_t taken = state.ring->Read(in_left, in_right, needed);
+    if (taken < needed) {
+        const std::size_t missing = needed - taken;
+        std::memset(in_left + taken, 0, missing * sizeof(float));
+        std::memset(in_right + taken, 0, missing * sizeof(float));
         state.stats->underruns.fetch_add(1, std::memory_order_relaxed);
         state.stats->underrun_frames.fetch_add(missing, std::memory_order_relaxed);
-        state.primed = false;  // refill to the target before consuming again
+        state.primed = false;
     }
+
+    state.resampler.Process(in_left, in_right, frames, step, left, right);
+
+    state.stats->drift_frames.fetch_add(
+        static_cast<std::int64_t>(needed) - static_cast<std::int64_t>(frames),
+        std::memory_order_relaxed);
+    state.stats->drift_ppm.store(static_cast<std::int32_t>(state.drift.correction_ppm()),
+                                 std::memory_order_relaxed);
+    state.stats->average_fill_frames.store(
+        static_cast<std::uint32_t>(state.drift.average_fill() < 0.0 ? 0.0
+                                                                   : state.drift.average_fill()),
+        std::memory_order_relaxed);
 }
 
 void RenderSink::MixInto(std::uint8_t* destination, std::size_t frames) noexcept {
-    PullSource(chat_, frames, chat_left_.data(), chat_right_.data());
-    PullSource(mic_, frames, mic_left_.data(), mic_right_.data());
+    PullSource(chat_, frames);
+    PullSource(mic_, frames);
 
-    const float* chat_left = chat_left_.data();
-    const float* chat_right = chat_right_.data();
-    const float* mic_left = mic_left_.data();
-    const float* mic_right = mic_right_.data();
+    // Spec 4.7: the gate belongs to the microphone alone. Gating the sum would
+    // cut the chat off whenever nobody in this room is talking.
+    const DynamicsBlock gated = gate_.Process(mic_.left.data(), mic_.right.data(), frames);
+    if (gated.active_frames > 0) {
+        stats_.gate_frames.fetch_add(gated.active_frames, std::memory_order_relaxed);
+        PublishMinGain(stats_.gate_min_gain, gated.min_gain);
+    }
+
+    const float* chat_left = chat_.left.data();
+    const float* chat_right = chat_.right.data();
+    const float* mic_left = mic_.left.data();
+    const float* mic_right = mic_.right.data();
     float* out_left = out_left_.data();
     float* out_right = out_right_.data();
 
@@ -524,37 +580,41 @@ void RenderSink::MixInto(std::uint8_t* destination, std::size_t frames) noexcept
     const float mic_goal = mic_.gain_target;
     const float coeff = gain_coeff_;
 
-    std::uint64_t clipped = 0;
     for (std::size_t i = 0; i < frames; ++i) {
         chat_gain += (chat_goal - chat_gain) * coeff;
         mic_gain += (mic_goal - mic_gain) * coeff;
-
-        float left = chat_left[i] * chat_gain + mic_left[i] * mic_gain;
-        float right = chat_right[i] * chat_gain + mic_right[i] * mic_gain;
-
-        // Stage 3 replaces this with a proper limiter; until then a hard clamp
-        // at least keeps the cable from receiving out-of-range samples.
-        if (left > 1.0f) {
-            left = 1.0f;
-            ++clipped;
-        } else if (left < -1.0f) {
-            left = -1.0f;
-            ++clipped;
-        }
-        if (right > 1.0f) {
-            right = 1.0f;
-            ++clipped;
-        } else if (right < -1.0f) {
-            right = -1.0f;
-            ++clipped;
-        }
-
-        out_left[i] = left;
-        out_right[i] = right;
+        out_left[i] = chat_left[i] * chat_gain + mic_left[i] * mic_gain;
+        out_right[i] = chat_right[i] * chat_gain + mic_right[i] * mic_gain;
     }
 
     chat_.gain_current = chat_gain;
     mic_.gain_current = mic_gain;
+
+    const DynamicsBlock limited = limiter_.Process(out_left, out_right, frames);
+    if (limited.active_frames > 0) {
+        stats_.limiter_frames.fetch_add(limited.active_frames, std::memory_order_relaxed);
+        PublishMinGain(stats_.limiter_min_gain, limited.min_gain);
+    }
+
+    // Safety net. With the limiter enabled nothing can reach it, which is
+    // exactly why a non-zero count here is worth seeing in the log.
+    std::uint64_t clipped = 0;
+    for (std::size_t i = 0; i < frames; ++i) {
+        if (out_left[i] > 1.0f) {
+            out_left[i] = 1.0f;
+            ++clipped;
+        } else if (out_left[i] < -1.0f) {
+            out_left[i] = -1.0f;
+            ++clipped;
+        }
+        if (out_right[i] > 1.0f) {
+            out_right[i] = 1.0f;
+            ++clipped;
+        } else if (out_right[i] < -1.0f) {
+            out_right[i] = -1.0f;
+            ++clipped;
+        }
+    }
     if (clipped > 0) {
         stats_.clipped_samples.fetch_add(clipped, std::memory_order_relaxed);
     }
@@ -659,7 +719,7 @@ HRESULT AudioEngine::Start(IMMDeviceEnumerator* enumerator, const Config& config
         return E_FAIL;
     }
 
-    cable_.Bind(chat_, mic_, config.audio, config.mix);
+    cable_.Bind(chat_, mic_, config);
     LogStartupSummary(config);
     return S_OK;
 }
@@ -690,15 +750,44 @@ void AudioEngine::LogStartupSummary(const Config& config) {
         LogWarn(L"  matched by name fragment, not by endpoint id - copy the id into the config");
     }
 
-    LogInfo(L"mix: chat {:+.1f} dB, mic {:+.1f} dB, smoothing {:.1f} ms, hard clamp on the sum "
-            L"(the limiter lands in stage 3)",
+    LogInfo(L"mix: chat {:+.1f} dB, mic {:+.1f} dB, smoothing {:.1f} ms",
             config.mix.chat_gain_db, config.mix.mic_gain_db, config.mix.gain_smoothing_ms);
-    LogInfo(L"target ring fill {:.1f} ms; estimated added latency ~{:.1f} ms "
-            L"(render buffer {:.1f} ms + ring {:.1f} ms)",
-            config.audio.target_buffer_ms, cable_.buffer_ms() + config.audio.target_buffer_ms,
-            cable_.buffer_ms(), config.audio.target_buffer_ms);
-    LogInfo(L"drift compensation is not implemented yet (stage 3): expect the offset to grow "
-            L"slowly over a long session");
+    if (config.mix.limiter_enabled) {
+        LogInfo(L"limiter: peak, no lookahead, threshold {:+.1f} dBFS, release {:.0f} ms",
+                config.mix.limiter_threshold_db, config.mix.limiter_release_ms);
+    } else {
+        LogWarn(L"limiter: disabled - simultaneous chat and microphone peaks will clamp");
+    }
+    if (config.gate.enabled) {
+        LogInfo(L"gate: microphone only, threshold {:.1f} dBFS, attack {:.1f} ms, hold {:.0f} ms, "
+                L"release {:.0f} ms",
+                config.gate.threshold_db, config.gate.attack_ms, config.gate.hold_ms,
+                config.gate.release_ms);
+    }
+
+    // The render thread takes a whole block out of each ring at once, so the
+    // fill it regulates is really "one block plus the margin left over". That
+    // margin, not the target itself, is what a scheduling hiccup eats into.
+    const double margin_ms = config.audio.target_buffer_ms - cable_.buffer_ms();
+    LogInfo(L"target ring fill {:.1f} ms, leaving {:.1f} ms after each render block; estimated "
+            L"added latency {:.1f}-{:.1f} ms (ring {:.1f} ms + render buffer {:.1f} ms)",
+            config.audio.target_buffer_ms, margin_ms, config.audio.target_buffer_ms,
+            config.audio.target_buffer_ms + cable_.buffer_ms(), config.audio.target_buffer_ms,
+            cable_.buffer_ms());
+    if (margin_ms < cable_.buffer_ms() * 0.5) {
+        LogWarn(L"  that margin is thin: raise audio.target_buffer_ms above {:.0f} ms, or lower "
+                L"Max Latency in VBCABLE_ControlPanel.exe to shrink the {:.1f} ms render block",
+                cable_.buffer_ms() * 1.5, cable_.buffer_ms());
+    }
+    if (config.drift.enabled && config.drift.max_rate_correction > 0.0) {
+        LogInfo(L"drift compensation: up to {:+.0f} ppm of read-rate correction, fill averaged "
+                L"over {:.1f} s, loop settles in about {:.0f} s",
+                config.drift.max_rate_correction * 1.0e6, config.drift.measure_window_s,
+                config.drift.response_s);
+    } else {
+        LogWarn(L"drift compensation: disabled - the ring fill will walk away from the target "
+                L"until the resync valve drops a backlog");
+    }
 }
 
 void AudioEngine::Run(HANDLE stop_event, std::uint32_t stats_interval_s) {
@@ -780,10 +869,16 @@ void AudioEngine::Stop() {
 void AudioEngine::LogCounters(const wchar_t* prefix) {
     const auto report = [&](const wchar_t* role, CaptureSource& source) {
         const SourceStats& s = source.stats();
-        LogInfo(L"{} {}: fill {:.1f} ms, frames {}, silent packets {}, discontinuities {}, "
-                L"underruns {} ({:.1f} ms), overruns {} ({:.1f} ms), resyncs {} ({:.1f} ms)",
+        const std::int64_t drift = s.drift_frames.load(std::memory_order_relaxed);
+        LogInfo(L"{} {}: fill {:.1f} ms (avg {:.1f}), drift {:+} ppm, corrected {:+.1f} ms, "
+                L"frames {}, silent packets {}, discontinuities {}, underruns {} ({:.1f} ms), "
+                L"overruns {} ({:.1f} ms), resyncs {} ({:.1f} ms)",
                 prefix, role,
                 FramesToMs(s.fill_frames.load(std::memory_order_relaxed), sample_rate_),
+                FramesToMs(s.average_fill_frames.load(std::memory_order_relaxed), sample_rate_),
+                s.drift_ppm.load(std::memory_order_relaxed),
+                (drift < 0 ? -1.0 : 1.0) *
+                    FramesToMs(static_cast<std::uint64_t>(drift < 0 ? -drift : drift), sample_rate_),
                 s.frames.load(std::memory_order_relaxed),
                 s.silent_packets.load(std::memory_order_relaxed),
                 s.discontinuities.load(std::memory_order_relaxed),
@@ -798,11 +893,30 @@ void AudioEngine::LogCounters(const wchar_t* prefix) {
     report(L"chat", chat_);
     report(L"mic", mic_);
 
-    const RenderStats& r = cable_.stats();
-    LogInfo(L"{} render: callbacks {}, frames {} ({:.1f} s), clipped samples {}, timeouts {}",
-            prefix, r.callbacks.load(std::memory_order_relaxed),
-            r.frames.load(std::memory_order_relaxed),
-            FramesToMs(r.frames.load(std::memory_order_relaxed), sample_rate_) / 1000.0,
+    RenderStats& r = cable_.stats();
+    const std::uint64_t rendered = r.frames.load(std::memory_order_relaxed);
+    const auto percent = [&](std::uint64_t frames) {
+        return rendered == 0 ? 0.0 : 100.0 * static_cast<double>(frames) / static_cast<double>(rendered);
+    };
+
+    // Reading the peak also arms it for the next interval, so each report
+    // describes its own window rather than the whole session.
+    std::wstring dynamics;
+    if (cable_.limiter().enabled()) {
+        const std::uint32_t peak = r.limiter_min_gain.exchange(kGainQ16One, std::memory_order_relaxed);
+        dynamics += std::format(L", limiter {:.1f} dB peak on {:.2f} % of frames",
+                                DbFromGain(GainFromQ16(peak)),
+                                percent(r.limiter_frames.load(std::memory_order_relaxed)));
+    }
+    if (cable_.gate().enabled()) {
+        r.gate_min_gain.store(kGainQ16One, std::memory_order_relaxed);
+        dynamics += std::format(L", gate attenuating {:.1f} % of frames",
+                                percent(r.gate_frames.load(std::memory_order_relaxed)));
+    }
+
+    LogInfo(L"{} render: callbacks {}, frames {} ({:.1f} s){}, clipped samples {}, timeouts {}",
+            prefix, r.callbacks.load(std::memory_order_relaxed), rendered,
+            FramesToMs(rendered, sample_rate_) / 1000.0, dynamics,
             r.clipped_samples.load(std::memory_order_relaxed),
             r.timeouts.load(std::memory_order_relaxed));
 }

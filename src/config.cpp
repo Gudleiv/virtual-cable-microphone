@@ -317,6 +317,7 @@ ConfigLoad LoadConfigFile(const std::filesystem::path& path) {
 
     reader.Bool(L"drift.enabled", c.drift.enabled);
     reader.Double(L"drift.measure_window_s", c.drift.measure_window_s, 0.1, 30.0);
+    reader.Double(L"drift.response_s", c.drift.response_s, 1.0, 120.0);
     reader.Double(L"drift.max_rate_correction", c.drift.max_rate_correction, 0.0, 0.02);
 
     reader.Integer(L"resilience.backoff_min_ms", c.resilience.backoff_min_ms, 10, 60000);
@@ -334,6 +335,12 @@ ConfigLoad LoadConfigFile(const std::filesystem::path& path) {
 
     if (c.resilience.backoff_max_ms < c.resilience.backoff_min_ms) {
         result.errors.push_back(L"resilience.backoff_max_ms must be >= resilience.backoff_min_ms");
+    }
+    if (c.drift.enabled && c.drift.response_s < c.drift.measure_window_s * 3.0) {
+        result.warnings.push_back(std::format(
+            L"drift.response_s ({:.1f}) is less than 3x drift.measure_window_s ({:.1f}); the "
+            L"correction loop reacts faster than it can measure and will hunt",
+            c.drift.response_s, c.drift.measure_window_s));
     }
     if (c.audio.ring_capacity_ms < c.audio.target_buffer_ms * 3.0) {
         result.warnings.push_back(std::format(

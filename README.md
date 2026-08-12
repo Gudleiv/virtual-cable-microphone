@@ -44,17 +44,16 @@ The full specification is in [`docs/gc7-virtual-mic-spec.md`](docs/gc7-virtual-m
 |---|---|---|
 | 1 | project skeleton, `--list-devices`, config parser, logging | **done** |
 | 2 | three streams, lock-free SPSC rings, mixing | **done** |
-| 3 | drift compensation, limiter, noise gate | not started |
+| 3 | drift compensation, limiter, noise gate | **done** |
 | 4 | `IMMNotificationClient`, device-invalidation recovery, backoff | not started |
 | 5 | tray icon, autostart | not started |
 
-Running `vcmic` with no mode option now mixes chat and microphone into the
-cable until Ctrl+C. What is still missing is drift compensation: the three
-endpoints run on three independent clocks, and without correction the ring fill
-level walks away until the resync valve drops a backlog — one audible glitch
-every ten to twenty minutes at a typical 100 ppm mismatch. Stage 3 fixes that.
-See [`docs/testing-notes.md`](docs/testing-notes.md) for what has been measured
-and what has not.
+Running `vcmic` with no mode option mixes chat and microphone into the cable
+until Ctrl+C, correcting for the three clocks as it goes. What is still missing
+is resilience: a USB DAC that re-enumerates on sleep/wake or replug currently
+stops its stream for good instead of rebuilding it. Stage 4 fixes that. See
+[`docs/testing-notes.md`](docs/testing-notes.md) for what has been measured and
+what has not.
 
 ## Requirements
 
@@ -106,9 +105,13 @@ vcmic --help
 Exit codes: `0` success, `1` bad command line, `2` failure.
 
 While running, vcmic logs a counter report every `log.stats_interval_s`
-seconds: the fill level of each ring, plus underruns, overruns, resyncs,
-discontinuities and clipped samples. A healthy session shows a fill level near
-`audio.target_buffer_ms` and zeros everywhere else.
+seconds: the fill level of each ring and the drift correction being applied to
+it, plus underruns, overruns, resyncs, discontinuities, limiter activity and
+clipped samples. A healthy session shows a fill level sitting on
+`audio.target_buffer_ms`, a drift figure that settles within the first minute
+and then stays put, and zeros everywhere else. `corrected` is cumulative: it is
+the skew that would otherwise have accumulated, and it is expected to grow
+steadily.
 
 ## How the audio path works
 
@@ -133,6 +136,32 @@ the steady-state latency is what the config asks for rather than whatever the
 startup race produces. A source that stalls goes back to refilling, and a
 backlog past four times the target is dropped rather than carried as permanent
 latency.
+
+### Three clocks
+
+The GC7's capture side, its render side and the cable each run on their own
+crystal, and none of them is the cable's. On this machine the microphone runs
+about 198 ppm fast, which is 713 ms of skew per hour — the whole reason
+`audio.target_buffer_ms` cannot simply be left to look after itself.
+
+So the render thread reads each ring at a rate slightly different from the one
+it plays at, interpolating between input samples with a four-point Catmull-Rom
+kernel. A PI loop drives that rate from the ring's own fill level, averaged over
+`drift.measure_window_s`: the integral term converges on the true clock ratio
+and holds it there, so the fill sits on target instead of walking away. Hard
+drops stay as the emergency valve for a stall the correction cannot absorb, and
+they are counted as resyncs.
+
+The one thing to know when picking `audio.target_buffer_ms`: the render thread
+takes a **whole block** out of each ring per callback, so the margin against an
+underrun is `target_buffer_ms` minus the cable's block, not the target itself.
+The startup log prints both, and warns when the difference gets thin. With
+VB-CABLE's default 22 ms block, a 25 ms target leaves nothing; either raise the
+target to ~40 ms or lower Max Latency in `VBCABLE_ControlPanel.exe`.
+
+The sum then goes through a peak limiter with no lookahead — the gain is never
+allowed above what the current sample permits, so nothing can overshoot the
+threshold — and an optional noise gate sits on the microphone alone.
 
 ### Setting it up
 
@@ -225,6 +254,12 @@ src/
   main.cpp              command line, --list-devices, --check-config
   device_registry.*     endpoint enumeration, properties, id/name resolution
   audio_format.*        WAVEFORMATEXTENSIBLE inspection and formatting
+  audio_engine.*        the three streams, the mixer and the render callback
+  drift.*               fractional-rate reader and the fill-level control loop
+  dynamics.*            peak limiter and noise gate
+  ring_buffer.h         lock-free SPSC ring of deinterleaved stereo float32
+  sample_convert.*      capture/render format conversion, downmix and upmix
+  audio_stats.h         the counters the audio threads publish
   config.*              the TOML-subset parser and the typed configuration
   logging.*             levelled, rotating log file
   console.*             UTF-16/UTF-8 console output

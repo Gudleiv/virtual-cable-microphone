@@ -4,6 +4,8 @@
 #include "com.h"
 #include "config.h"
 #include "device_registry.h"
+#include "drift.h"
+#include "dynamics.h"
 #include "ring_buffer.h"
 #include "sample_convert.h"
 #include "win_headers.h"
@@ -84,7 +86,8 @@ private:
 
 // The render stream on the cable, and the clock master of the whole thing
 // (spec 4.4): it is event-driven, and every event pulls whatever both rings
-// have, mixes it and hands it to WASAPI.
+// have, resamples each of them to the cable's clock, mixes and hands the
+// result to WASAPI.
 class RenderSink {
 public:
     RenderSink();
@@ -97,9 +100,10 @@ public:
                  const AudioConfig& audio, std::wstring& error);
     void Close();
 
-    // Must be called before StartThread; `chat` and `mic` have to outlive the thread.
-    void Bind(CaptureSource& chat, CaptureSource& mic, const AudioConfig& audio,
-              const MixConfig& mix);
+    // Must be called before StartThread; `chat` and `mic` have to outlive the
+    // thread. This is where every audio-path buffer is sized, so that the
+    // thread itself never allocates.
+    void Bind(CaptureSource& chat, CaptureSource& mic, const Config& config);
 
     bool StartThread(HANDLE stop_event);
     void JoinThread();
@@ -112,13 +116,16 @@ public:
     std::uint32_t buffer_frames() const { return buffer_frames_; }
     double buffer_ms() const;
 
+    const PeakLimiter& limiter() const { return limiter_; }
+    const NoiseGate& gate() const { return gate_; }
+
     RenderStats& stats() { return stats_; }
     HRESULT fault() const { return fault_.load(std::memory_order_relaxed); }
 
 private:
-    // Consumer-side view of one capture ring. The fill level is managed here
-    // rather than in CaptureSource because only the render thread may move the
-    // read index.
+    // Consumer-side view of one capture ring. The fill level and the drift
+    // correction live here rather than in CaptureSource because only the render
+    // thread may move the read index.
     struct SourceState {
         StereoRing* ring = nullptr;
         SourceStats* stats = nullptr;
@@ -127,11 +134,20 @@ private:
         std::size_t max_frames = 0;
         float gain_current = 1.0f;
         float gain_target = 1.0f;
+
+        bool drift_enabled = false;
+        DriftController drift;
+        StereoResampler resampler;
+
+        std::vector<float> in_left;   // ring reads, one block plus correction headroom
+        std::vector<float> in_right;
+        std::vector<float> left;      // this source's contribution, on the cable's clock
+        std::vector<float> right;
     };
 
     void ThreadMain(HANDLE stop_event);
     void MixInto(std::uint8_t* destination, std::size_t frames) noexcept;
-    void PullSource(SourceState& state, std::size_t frames, float* left, float* right) noexcept;
+    void PullSource(SourceState& state, std::size_t frames) noexcept;
 
     ComPtr<IMMDevice> device_;
     ComPtr<IAudioClient> client_;
@@ -150,11 +166,11 @@ private:
     SourceState chat_;
     SourceState mic_;
     float gain_coeff_ = 1.0f;
+    double inv_rate_ = 0.0;  // seconds per frame, so the audio path never divides
 
-    std::vector<float> chat_left_;
-    std::vector<float> chat_right_;
-    std::vector<float> mic_left_;
-    std::vector<float> mic_right_;
+    NoiseGate gate_;
+    PeakLimiter limiter_;
+
     std::vector<float> out_left_;
     std::vector<float> out_right_;
 

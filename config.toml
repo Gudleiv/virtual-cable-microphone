@@ -39,7 +39,17 @@ output_render_name = "CABLE-A Input"
 # All three endpoints report 48000 Hz, so the strict check can stay on.
 sample_rate = 48000
 require_sample_rate = true
-target_buffer_ms = 25.0
+
+# The cable's render block measured 1056 frames = 22.0 ms on this machine, and
+# the render thread takes a whole block out of each ring at once. So the real
+# margin against an underrun is target_buffer_ms minus 22 ms, not the target
+# itself: at 25 ms there was none left, which is what produced the underrun
+# when the chat endpoint went quiet. 40 ms leaves 18 ms of margin.
+#
+# The better trade is to shrink the block instead: Max Latency = 512 samples in
+# VBCABLE_ControlPanel.exe makes it 10.7 ms, and then 20 ms here is comfortable
+# and the total added latency drops to about 31 ms.
+target_buffer_ms = 40.0
 ring_capacity_ms = 250.0
 
 [mix]
@@ -47,6 +57,16 @@ ring_capacity_ms = 250.0
 chat_gain_db = 0.0
 mic_gain_db = 0.0
 limiter_enabled = true
+
+[drift]
+# Measured on this machine over two runs: the fifine microphone runs about
+# +198 ppm fast against the cable, and the GC7 loopback is effectively locked
+# to it. 198 ppm is 713 ms per hour, so this is not optional here. The 1000 ppm
+# ceiling leaves five times the headroom actually needed.
+enabled = true
+measure_window_s = 1.0
+response_s = 10.0
+max_rate_correction = 0.001
 
 [log]
 level = "info"

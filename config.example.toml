@@ -54,12 +54,20 @@ mic_gain_db = 0.0
 gain_smoothing_ms = 10.0
 
 # Peak limiter on the sum, so that both of you talking at once cannot clip.
+# Attack is instantaneous and there is no lookahead, so nothing can overshoot
+# the threshold; the release is what keeps a caught peak from ducking the rest.
 limiter_enabled = true
 limiter_threshold_db = -1.0
 limiter_release_ms = 80.0
 
 [gate]
-# Optional noise gate on the microphone only. Off by default.
+# Optional noise gate on the microphone only - the chat side is never gated,
+# or your friends would disappear whenever you stopped talking. Off by default.
+#
+# threshold_db is the level that opens the gate; it stays open until the signal
+# falls 6 dB below that, which stops it chattering on a voice sitting right on
+# the threshold. attack/hold/release are the ramp up, the wait before closing
+# and the ramp down; the times are how long the ramp takes to cover ~95 %.
 enabled = false
 threshold_db = -45.0
 attack_ms = 5.0
@@ -68,12 +76,23 @@ release_ms = 150.0
 
 [drift]
 # The three endpoints run on three independent clocks. At 100 ppm that is about
-# 360 ms of skew per hour, so correction is on by default: the read rate is
-# nudged by at most max_rate_correction (0.001 = 0.1 %) to hold the ring at
-# target_buffer_ms. Hard drops and inserts stay as an emergency fallback and are
-# always logged.
+# 360 ms of skew per hour, so correction is on by default: each ring is read
+# slightly faster or slower than the cable plays, with Catmull-Rom interpolation
+# in between, to hold its fill at target_buffer_ms. Hard drops and inserts stay
+# as an emergency fallback and are always counted as resyncs.
 enabled = true
+
+# How long the fill level is averaged before the loop acts on it. A single
+# reading jumps by a whole capture packet, so this has to be well above one.
 measure_window_s = 1.0
+
+# Time constant of the correction loop. It settles in roughly four times this.
+# Keep it at several times measure_window_s or the loop will hunt.
+response_s = 10.0
+
+# Largest read-rate correction allowed, as a fraction: 0.001 = 0.1 % = 1000 ppm.
+# A USB microphone is typically 100-300 ppm off, so this has room to spare. Set
+# it to 0 to bypass the resampler entirely and get the uncorrected path back.
 max_rate_correction = 0.001
 
 [resilience]
