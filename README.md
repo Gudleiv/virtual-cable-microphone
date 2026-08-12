@@ -186,9 +186,29 @@ The log file is written next to the executable too, and rotates by size
 
 ## Known external pitfalls
 
+- **ShadowPlay will not keep a `LineLevel` endpoint as the microphone.** The
+  selection can be made and then silently reverts. Confirmed on this machine:
+  every endpoint that persisted reported `PKEY_AudioEndpoint_FormFactor =
+  Microphone`, including virtual ones, and both VB-CABLE outputs reported
+  `LineLevel`. Rewriting the property fixes it. As administrator, with the
+  endpoint GUID taken from `--list-devices`:
+
+  ```powershell
+  $k = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{a789742f-ab35-41b1-b651-1c86c68a1787}"
+  reg export $k "$env:USERPROFILE\cable-a-output-backup.reg"
+  reg add "$k\Properties" /v "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},0" /t REG_DWORD /d 4 /f
+  ```
+
+  4 is `Microphone`, 2 is `LineLevel`. Disable and re-enable the device
+  afterwards, then check with `vcmic --list-devices` that the form factor
+  changed. VB-CABLE reinstalls and driver updates may reset it.
 - **ShadowPlay drops the microphone selection** when the Windows Recording tab
   has fewer than four active devices. Show disabled devices and enable enough of
   them.
+- **Separate audio tracks means the microphone is track 2**, and most players
+  only play the first one. A clip that sounds like it contains nothing but the
+  game usually contains both; check with a player that can switch audio tracks
+  before concluding the microphone was not recorded.
 - ShadowPlay's system track follows whatever output is assigned to the
   `NVIDIA Container` process under *App volume and device preferences*. If the
   game disappears from the recording, look there.
