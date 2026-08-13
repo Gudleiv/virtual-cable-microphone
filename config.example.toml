@@ -39,7 +39,15 @@ require_sample_rate = true
 # Steady-state fill level of each capture ring, in milliseconds. This is the
 # dominant part of the added latency; drift correction pulls the fill level back
 # to this target. Lower is tighter but less tolerant of scheduling hiccups.
-target_buffer_ms = 25.0
+#
+# Careful: the render thread takes a *whole* block out of each ring per
+# callback, so what a scheduling hiccup eats into is this value minus the
+# cable's block, not this value. VB-CABLE's default block is 22 ms, which leaves
+# nothing at all at 25 ms - hence the 40 ms default here. The better trade is to
+# shrink the block instead: Max Latency = 512 samples in
+# VBCABLE_ControlPanel.exe makes it 10.7 ms, and then 20 ms here is comfortable.
+# The startup log prints both numbers and warns when the margin gets thin.
+target_buffer_ms = 40.0
 
 # Total ring size. Keep it at several times target_buffer_ms so a scheduling
 # stall costs a bit of latency rather than an overrun.
@@ -86,12 +94,13 @@ enabled = true
 # reading jumps by a whole capture packet, so this has to be well above one.
 measure_window_s = 1.0
 
-# Time constant of the correction loop; it settles in roughly six times this.
-# This is the noise/speed trade: whatever jitter survives measure_window_s comes
-# back out as a wobble on the read rate in proportion to 1/response_s. Measured
-# against the target machine's own timing noise, 10 s wobbles by about 90 ppm,
-# 30 s by 26 ppm and 45 s by 17 ppm. 30 s is quiet enough that the logged drift
-# figure means something, and clock ratios do not change anyway.
+# Time constant of the correction loop. This is the noise/speed trade: whatever
+# jitter survives measure_window_s comes back out as a wobble on the read rate
+# in proportion to 1/response_s. Measured against the target machine's own
+# timing noise, 10 s wobbles by about 90 ppm and reaches a new clock ratio in
+# ~10 s; 30 s wobbles by 30 ppm and takes 20-26 s; 45 s wobbles by 17 ppm and
+# takes ~35 s. 30 s is quiet enough that the logged drift figure means
+# something, and clock ratios do not change during a session anyway.
 response_s = 30.0
 
 # Largest read-rate correction allowed, as a fraction: 0.001 = 0.1 % = 1000 ppm.

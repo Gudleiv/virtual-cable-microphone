@@ -1,7 +1,8 @@
 # vcmic — virtual cable microphone for ShadowPlay
 
-A user-mode Windows service that builds the microphone track NVIDIA ShadowPlay
-is missing.
+A resident user-mode Windows program that builds the microphone track NVIDIA
+ShadowPlay is missing. Deliberately not a service — see
+[below](#why-this-is-not-a-windows-service).
 
 ShadowPlay records system audio as a WASAPI loopback of exactly **one** endpoint
 — the default output device. The Sound Blaster GC7 exposes two independent

@@ -28,7 +28,10 @@ struct DevicesConfig {
 struct AudioConfig {
     std::uint32_t sample_rate = 48000;
     bool require_sample_rate = true;  // spec 4.5: fail loudly instead of resampling
-    double target_buffer_ms = 25.0;   // steady-state fill level of each ring
+    // Steady-state fill level of each ring. The render thread drains a whole
+    // block per callback, so the usable margin is this minus the cable's block;
+    // 40 ms clears VB-CABLE's default 22 ms block with room to spare.
+    double target_buffer_ms = 40.0;
     double ring_capacity_ms = 250.0;  // headroom before an overrun is unavoidable
 };
 
