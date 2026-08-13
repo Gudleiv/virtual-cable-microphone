@@ -46,6 +46,11 @@ struct SourceStats {
     std::atomic<std::int64_t> drift_frames{0};
     std::atomic<std::int32_t> drift_ppm{0};
     std::atomic<std::uint32_t> average_fill_frames{0};
+
+    // False while the source is refilling to the target and being mixed as
+    // silence. The averaged fill and the correction stop moving then, so the
+    // report has to say so rather than show figures that stopped being true.
+    std::atomic<bool> primed{false};
 };
 
 struct RenderStats {

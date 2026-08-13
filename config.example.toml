@@ -86,9 +86,13 @@ enabled = true
 # reading jumps by a whole capture packet, so this has to be well above one.
 measure_window_s = 1.0
 
-# Time constant of the correction loop. It settles in roughly four times this.
-# Keep it at several times measure_window_s or the loop will hunt.
-response_s = 10.0
+# Time constant of the correction loop; it settles in roughly six times this.
+# This is the noise/speed trade: whatever jitter survives measure_window_s comes
+# back out as a wobble on the read rate in proportion to 1/response_s. Measured
+# against the target machine's own timing noise, 10 s wobbles by about 90 ppm,
+# 30 s by 26 ppm and 45 s by 17 ppm. 30 s is quiet enough that the logged drift
+# figure means something, and clock ratios do not change anyway.
+response_s = 30.0
 
 # Largest read-rate correction allowed, as a fraction: 0.001 = 0.1 % = 1000 ppm.
 # A USB microphone is typically 100-300 ppm off, so this has room to spare. Set

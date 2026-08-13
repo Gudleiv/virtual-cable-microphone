@@ -52,7 +52,7 @@ struct GateConfig {
 struct DriftConfig {
     bool enabled = true;
     double measure_window_s = 1.0;        // spec 4.6: average the fill before acting on it
-    double response_s = 10.0;             // time constant of the correction loop
+    double response_s = 30.0;             // time constant of the correction loop
     double max_rate_correction = 0.001;   // +-0.1 %
 };
 

@@ -126,9 +126,13 @@ void TestResampler(double ratio, double freq, const char* label) {
 
 struct LoopResult {
     double settled_ppm = 0.0;
+    double mean_ppm = 0.0;      // what the accumulated correction actually works out to
+    double ppm_stdev = 0.0;     // how much the applied rate wobbles around it
     double min_wake_ms = 1e9;   // fill the render thread sees; this is what is regulated
     double max_wake_ms = -1e9;
     double min_left_ms = 1e9;   // fill after the block was taken; this is what runs out
+    double avg_fill_span_ms = 0.0;  // swing of the averaged fill the loop measures
+    double settle_s = -1.0;         // first time the correction reached the true drift
     std::uint64_t resyncs = 0;
     std::uint64_t underruns = 0;
 };
@@ -138,8 +142,13 @@ struct LoopResult {
 // wakeup the ring holds whatever was left last time plus one block of new
 // audio: regulating the wake-time fill to `target` leaves `target - block`
 // as the real margin against an underrun.
+// `wander_frames` sets how much the capture/render timing drifts around on a
+// timescale of seconds. The default is calibrated against the target machine:
+// a ten-minute session there showed the correction wobbling with a standard
+// deviation of 157 ppm, which at kp = 0.2 means about 0.8 ms of noise left on
+// the averaged fill.
 LoopResult RunLoop(double source_ppm, double minutes, const DriftConfig& config, double target_ms,
-                   std::size_t block = 1056) {
+                   double wander_frames = 320.0, std::size_t block = 1056) {
     const std::size_t target = static_cast<std::size_t>(target_ms * kRate / 1000.0);
     const std::size_t max_frames = target * 4;
 
@@ -155,23 +164,40 @@ LoopResult RunLoop(double source_ppm, double minutes, const DriftConfig& config,
     std::vector<float> in_l(8192), in_r(8192);
     std::vector<float> out_l(block), out_r(block);
 
-    ring.Write(scratch_l.data(), scratch_r.data(), target);  // primed
+    // Primed the way RenderSink does it: the real code starts consuming the
+    // moment the ring first reaches the target, so the loop's first measurement
+    // sits on the setpoint. Starting a whole block above it would slam the
+    // correction to the ceiling and make the settling time meaningless.
+    ring.Write(scratch_l.data(), scratch_r.data(), target - block);
 
     std::mt19937 rng(12345);
     std::uniform_int_distribution<int> jitter(-96, 96);  // +-2 ms of packet lumpiness
+    // White jitter alone averages away almost completely over a one-second
+    // window, which is not what the real machine does: capture packets and
+    // render wakeups both wander on a timescale of seconds, so the averaged
+    // fill still swings. This is that wander, as a mean-reverting walk.
+    std::normal_distribution<double> kick(0.0, 1.0);
+    double wander = 0.0;
+    const double wander_decay = static_cast<double>(block) / kRate / 2.0;  // ~2 s memory
+    const double wander_kick = wander_frames;
 
     const double rate = 1.0 + source_ppm * 1e-6;
     double produced_exact = 0.0;
     std::int64_t produced_total = 0;
     LoopResult result;
     bool primed = true;
+    double ppm_sum = 0.0, ppm_sum2 = 0.0;
+    std::size_t ppm_count = 0;
+    double min_avg = 1e9, max_avg = -1e9;
 
     const std::size_t callbacks =
         static_cast<std::size_t>(minutes * 60.0 * kRate / static_cast<double>(block));
 
     for (std::size_t c = 0; c < callbacks; ++c) {
         produced_exact += static_cast<double>(block) * rate;
-        std::int64_t want = static_cast<std::int64_t>(produced_exact) - produced_total + jitter(rng);
+        wander += (-wander * wander_decay) + kick(rng) * wander_kick * wander_decay;
+        std::int64_t want = static_cast<std::int64_t>(produced_exact + wander) - produced_total +
+                            jitter(rng);
         if (want < 0) want = 0;
         produced_total += want;
         std::size_t left = static_cast<std::size_t>(want);
@@ -206,14 +232,35 @@ LoopResult RunLoop(double source_ppm, double minutes, const DriftConfig& config,
         }
         resampler.Process(in_l.data(), in_r.data(), block, step, out_l.data(), out_r.data());
 
+        if (result.settle_s < 0.0 &&
+            std::fabs(drift.correction_ppm() - source_ppm) < 20.0) {
+            result.settle_s = static_cast<double>(c) * static_cast<double>(block) / kRate;
+        }
+
         const double wake_ms = 1000.0 * static_cast<double>(available) / kRate;
         const double left_ms = 1000.0 * static_cast<double>(ring.Readable()) / kRate;
         if (c > callbacks / 2) {
             if (wake_ms < result.min_wake_ms) result.min_wake_ms = wake_ms;
             if (wake_ms > result.max_wake_ms) result.max_wake_ms = wake_ms;
             if (left_ms < result.min_left_ms) result.min_left_ms = left_ms;
+
+            const double ppm = drift.correction_ppm();
+            ppm_sum += ppm;
+            ppm_sum2 += ppm * ppm;
+            ++ppm_count;
+            const double avg_ms = 1000.0 * drift.average_fill() / kRate;
+            if (avg_ms < min_avg) min_avg = avg_ms;
+            if (avg_ms > max_avg) max_avg = avg_ms;
         }
         result.settled_ppm = drift.correction_ppm();
+    }
+
+    if (ppm_count > 0) {
+        result.mean_ppm = ppm_sum / static_cast<double>(ppm_count);
+        const double variance = ppm_sum2 / static_cast<double>(ppm_count) -
+                                result.mean_ppm * result.mean_ppm;
+        result.ppm_stdev = variance > 0.0 ? std::sqrt(variance) : 0.0;
+        result.avg_fill_span_ms = max_avg - min_avg;
     }
     return result;
 }
@@ -237,7 +284,20 @@ void TestControlLoop() {
         char name[160];
 
         std::snprintf(name, sizeof name, "%s: learned correction (ppm)", c.label);
-        Check(std::fabs(r.settled_ppm - c.ppm) < 20.0, name, r.settled_ppm);
+        Check(std::fabs(r.mean_ppm - c.ppm) < 20.0, name, r.mean_ppm);
+
+        // The correction is what the audio actually gets resampled by, so noise
+        // on it is noise on the pitch. It also has to be quiet enough that the
+        // logged figure means something.
+        std::snprintf(name, sizeof name, "%s: correction wobble, 1 sigma (ppm)", c.label);
+        Check(r.ppm_stdev < 40.0, name, r.ppm_stdev);
+
+        std::snprintf(name, sizeof name, "%s: averaged fill swing (ms)", c.label);
+        Check(r.avg_fill_span_ms < 8.0, name, r.avg_fill_span_ms);
+
+        // The price of a quiet correction: the loop is deliberately slow.
+        std::snprintf(name, sizeof name, "%s: time to reach the true rate (s)", c.label);
+        Check(r.settle_s >= 0.0 && r.settle_s < 300.0, name, r.settle_s);
 
         std::snprintf(name, sizeof name, "%s: regulated fill, %.0f ms target", c.label, kTargetMs);
         Check(std::fabs(0.5 * (r.min_wake_ms + r.max_wake_ms) - kTargetMs) < 3.0, name,

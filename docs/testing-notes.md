@@ -39,12 +39,33 @@ a heap overflow rather than a subtle glitch.
 | resampler, ratio 1.0 | pass-through: tone at 0.5000, residual 138 dB down |
 | resampler, ±198 ppm | tone at 0.49999, residual 90 dB down at 1 kHz, 55 dB at 4 kHz, 36 dB at 8 kHz |
 | resampler, ±1000 ppm (the ceiling) | same figures; the artifact tracks frequency, not correction size |
-| control loop, +198 / −198 / 0 / +900 ppm | learns +198.8 / −197.3 / +0.2 / +900.7 ppm |
-| control loop, one hour each | fill held at 49.99 ms against a 50 ms target, 4.4 ms span, zero resyncs, zero underruns |
+| control loop, +198 / −198 / 0 / +900 ppm | learns +198.0 / −198.0 / +0.0 / +900.0 ppm, reached in 20-26 s |
+| control loop, one hour each | fill held at 50.19 ms against a 50 ms target, 7.6 ms span, zero resyncs, zero underruns |
+| correction wobble | 30 ppm, 1 sigma |
 | the same hour with `drift.enabled = false` | 4 resyncs, i.e. one dropped backlog every ~12 minutes |
 | beyond the ceiling (5000 ppm) | correction saturates, resync valve fires, fill still bounded |
 | limiter | nothing exceeds the threshold, bit-transparent below it |
 | gate | −60 dBFS noise stays shut, −20 dBFS speech passes at unity |
+
+The timing noise in the simulated source is calibrated against the machine
+rather than invented. A ten-minute session there ran the loop at
+`response_s = 10` and showed the correction wobbling with a standard deviation
+of about 157 ppm around the right answer — which at that setting means roughly
+0.8 ms of jitter surviving the one-second averaging window. Feeding the
+simulation a mean-reverting timing wander that reproduces that, then sweeping
+the loop, gave:
+
+| `response_s` | correction wobble, 1 sigma | time to reach the true rate |
+|---|---|---|
+| 10 s | 87-91 ppm | ~10 s |
+| 20 s | 40 ppm | ~15 s |
+| **30 s** | **30 ppm** | **20-26 s** |
+| 45 s | 17 ppm | ~35 s |
+
+30 s is the default: the wobble is small enough that the logged drift figure is
+readable, and clock ratios do not change during a session anyway. Smoothing the
+loop *output* instead was tried and dropped — it bought 12 % for an extra pole,
+because the noise is slower than any smoother short enough to be safe.
 
 The interpolation figures are the honest cost of Catmull-Rom: it rolls off
 towards Nyquist, so at the worst phase it loses 0.2 dB at 8 kHz and 3.3 dB at

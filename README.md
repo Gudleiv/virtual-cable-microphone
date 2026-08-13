@@ -152,6 +152,13 @@ and holds it there, so the fill sits on target instead of walking away. Hard
 drops stay as the emergency valve for a stall the correction cannot absorb, and
 they are counted as resyncs.
 
+`drift.response_s` is deliberately slow. Whatever timing jitter survives the
+averaging window comes back out of the proportional term as a wobble on the
+read rate, in proportion to `1/response_s`; the default of 30 s keeps that
+around 30 ppm and still reaches a new clock ratio inside half a minute. The
+figures behind that choice, measured against this machine's own timing noise,
+are in [`docs/testing-notes.md`](docs/testing-notes.md).
+
 The one thing to know when picking `audio.target_buffer_ms`: the render thread
 takes a **whole block** out of each ring per callback, so the margin against an
 underrun is `target_buffer_ms` minus the cable's block, not the target itself.

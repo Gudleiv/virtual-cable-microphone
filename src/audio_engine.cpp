@@ -486,6 +486,7 @@ void RenderSink::PullSource(SourceState& state, std::size_t frames) noexcept {
     // the startup race happens to produce.
     if (!state.primed) {
         if (available < state.target_frames) {
+            state.stats->primed.store(false, std::memory_order_relaxed);
             std::memset(left, 0, frames * sizeof(float));
             std::memset(right, 0, frames * sizeof(float));
             return;
@@ -497,6 +498,7 @@ void RenderSink::PullSource(SourceState& state, std::size_t frames) noexcept {
         state.drift.Resume(static_cast<double>(available));
         state.stats->primings.fetch_add(1, std::memory_order_relaxed);
     }
+    state.stats->primed.store(true, std::memory_order_relaxed);
 
     // Emergency path of spec 4.6: a backlog this large is a stall that already
     // happened, and keeping it would just add permanent latency. Drift
@@ -870,12 +872,24 @@ void AudioEngine::LogCounters(const wchar_t* prefix) {
     const auto report = [&](const wchar_t* role, CaptureSource& source) {
         const SourceStats& s = source.stats();
         const std::int64_t drift = s.drift_frames.load(std::memory_order_relaxed);
-        LogInfo(L"{} {}: fill {:.1f} ms (avg {:.1f}), drift {:+} ppm, corrected {:+.1f} ms, "
+
+        // A source that is refilling is mixed as silence, and its averaged fill
+        // and correction are frozen at whatever they were when it went quiet.
+        const bool primed = s.primed.load(std::memory_order_relaxed);
+        const std::wstring level =
+            primed ? std::format(L"fill {:.1f} ms (avg {:.1f})",
+                                 FramesToMs(s.fill_frames.load(std::memory_order_relaxed),
+                                            sample_rate_),
+                                 FramesToMs(s.average_fill_frames.load(std::memory_order_relaxed),
+                                            sample_rate_))
+                   : std::format(L"REFILLING, fill {:.1f} ms",
+                                 FramesToMs(s.fill_frames.load(std::memory_order_relaxed),
+                                            sample_rate_));
+
+        LogInfo(L"{} {}: {}, drift {}{:+} ppm, corrected {:+.1f} ms, "
                 L"frames {}, silent packets {}, discontinuities {}, underruns {} ({:.1f} ms), "
                 L"overruns {} ({:.1f} ms), resyncs {} ({:.1f} ms)",
-                prefix, role,
-                FramesToMs(s.fill_frames.load(std::memory_order_relaxed), sample_rate_),
-                FramesToMs(s.average_fill_frames.load(std::memory_order_relaxed), sample_rate_),
+                prefix, role, level, primed ? L"" : L"held at ",
                 s.drift_ppm.load(std::memory_order_relaxed),
                 (drift < 0 ? -1.0 : 1.0) *
                     FramesToMs(static_cast<std::uint64_t>(drift < 0 ? -drift : drift), sample_rate_),

@@ -63,9 +63,14 @@ limiter_enabled = true
 # +198 ppm fast against the cable, and the GC7 loopback is effectively locked
 # to it. 198 ppm is 713 ms per hour, so this is not optional here. The 1000 ppm
 # ceiling leaves five times the headroom actually needed.
+#
+# response_s is 30 rather than the first-cut 10: at 10 the correction chased the
+# machine's own timing jitter and wobbled by about 150 ppm around the right
+# value, which made the logged drift figure unreadable. It costs ~3 minutes to
+# settle after a start.
 enabled = true
 measure_window_s = 1.0
-response_s = 10.0
+response_s = 30.0
 max_rate_correction = 0.001
 
 [log]
