@@ -869,22 +869,29 @@ void AudioEngine::Stop() {
 }
 
 void AudioEngine::LogCounters(const wchar_t* prefix) {
-    const auto report = [&](const wchar_t* role, CaptureSource& source) {
+    const auto report = [&](const wchar_t* role, CaptureSource& source, const wchar_t* idle_hint) {
         const SourceStats& s = source.stats();
         const std::int64_t drift = s.drift_frames.load(std::memory_order_relaxed);
 
-        // A source that is refilling is mixed as silence, and its averaged fill
-        // and correction are frozen at whatever they were when it went quiet.
+        // Three states worth telling apart. A source that has not delivered a
+        // single packet is not slow to fill, it is not running at all: WASAPI
+        // loopback emits nothing whatsoever on a render endpoint nobody is
+        // playing into, so an untouched counter here means the chain was never
+        // exercised rather than that it is behind. A refilling source is mixed
+        // as silence, and its averaged fill and correction are frozen at
+        // whatever they were when it went quiet.
         const bool primed = s.primed.load(std::memory_order_relaxed);
+        const bool started = s.packets.load(std::memory_order_relaxed) != 0;
         const std::wstring level =
-            primed ? std::format(L"fill {:.1f} ms (avg {:.1f})",
-                                 FramesToMs(s.fill_frames.load(std::memory_order_relaxed),
-                                            sample_rate_),
-                                 FramesToMs(s.average_fill_frames.load(std::memory_order_relaxed),
-                                            sample_rate_))
-                   : std::format(L"REFILLING, fill {:.1f} ms",
-                                 FramesToMs(s.fill_frames.load(std::memory_order_relaxed),
-                                            sample_rate_));
+            !started ? std::format(L"NO DATA, not one packet - {}", idle_hint)
+            : primed ? std::format(L"fill {:.1f} ms (avg {:.1f})",
+                                   FramesToMs(s.fill_frames.load(std::memory_order_relaxed),
+                                              sample_rate_),
+                                   FramesToMs(s.average_fill_frames.load(std::memory_order_relaxed),
+                                              sample_rate_))
+                     : std::format(L"REFILLING, fill {:.1f} ms",
+                                   FramesToMs(s.fill_frames.load(std::memory_order_relaxed),
+                                              sample_rate_));
 
         LogInfo(L"{} {}: {}, drift {}{:+} ppm, corrected {:+.1f} ms, "
                 L"frames {}, silent packets {}, discontinuities {}, underruns {} ({:.1f} ms), "
@@ -904,8 +911,8 @@ void AudioEngine::LogCounters(const wchar_t* prefix) {
                 FramesToMs(s.resync_frames.load(std::memory_order_relaxed), sample_rate_));
     };
 
-    report(L"chat", chat_);
-    report(L"mic", mic_);
+    report(L"chat", chat_, L"is anything actually playing into that endpoint?");
+    report(L"mic", mic_, L"is the device still present?");
 
     RenderStats& r = cable_.stats();
     const std::uint64_t rendered = r.frames.load(std::memory_order_relaxed);
