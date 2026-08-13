@@ -28,6 +28,7 @@ add_executable(vcmic
     src/config.cpp
     src/console.cpp
     src/device_registry.cpp
+    src/device_watcher.cpp
     src/drift.cpp
     src/dynamics.cpp
     src/hresult.cpp

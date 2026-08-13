@@ -125,7 +125,8 @@ PulseAudio null sinks disagree by far more than any real hardware does:
   the convergence numbers come from the offline self-test instead. The real
   figures for this hardware were measured from the `frames` counters of live
   sessions on the target machine; see below.
-- **Anything to do with device re-enumeration**, sleep/wake or USB replug.
+- **Anything to do with device re-enumeration**, sleep/wake or USB replug. See
+  the stage 4 section below for what that leaves untested and how to check it.
 
 ## The target machine, with both sources live
 
@@ -168,3 +169,67 @@ Two behaviours worth recognising in a log, neither of them a fault:
 - A source that has never delivered a packet reports `NO DATA`, not
   `REFILLING`. On the chat row it means nothing is playing into that endpoint;
   loopback on an idle render endpoint emits no packets at all, not silent ones.
+
+## Stage 4: recovery, measured on the Wine rig
+
+The rig turned out to reach further than expected. `pactl unload-module` takes a
+null sink away from underneath a running stream, which is as close to yanking a
+USB cable as a container gets, and `pactl suspend-sink` produces the other case
+that matters: an endpoint that is still there but has stopped delivering.
+
+| Check | Result |
+|---|---|
+| capture endpoint removed | `AUDCLNT_E_DEVICE_INVALIDATED`, source reads `DOWN, rebuilding`, one 1.1 ms underrun as the ring drained, then mixed as silence |
+| ... while it was gone | the other capture source and the render were untouched; render callbacks kept climbing straight through the outage |
+| backoff | 109, 210, 409, 809, 1609, 3208, 5009 ms — the intended 100/200/400/800/1600/3200 and then the 5 s ceiling |
+| log volume | attempts 1-2 at WARN, the rest at DEBUG, recovery at INFO |
+| recovery | `mic stream back after 16.4 s and 9 attempt(s)`, then `rebuilt 1x` in the report |
+| new endpoint id after the reload | resolved through the name fallback, as a re-enumerated USB device would be |
+| render endpoint removed | same sequence on the clock master, `rebuilt 1x`, and the rings behaved as predicted: 1621 overruns / 16.2 s dropped while it was gone, then 4 resyncs trimming the backlog |
+| `ClockKeeper` on a live endpoint | sink went `SUSPENDED` → `RUNNING` while it pumped and back to `IDLE` when closed; 800 pumps over 4 s, zero failures |
+| loopback silence policy: endpoint suspended but present | 20 s of no packets, **no** rebuild — silence alone must never be treated as death there |
+
+The zombie case is why the silence watchdog exists. Removing a capture endpoint
+and re-adding it a second later left the stream answering `S_OK` from every
+call and delivering nothing, for as long as the test ran: `frames` frozen at
+355200 for 25 s, no error, no rebuild, the source silent forever. With the
+watchdog, the same sequence reads `mic stream lost: no capture packet for 5 s -
+rebuilding` and is serving again 8 ms later.
+
+### What the rig still could not check
+
+- **`IMMNotificationClient`.** `winepulse` never fires the callbacks — zero
+  notifications across every run, though registration itself succeeded. So every
+  recovery above was driven purely by the backoff timer. That is the design
+  intent, and it is reassuring that it holds up alone, but the claim that a
+  returning device is picked up in milliseconds rather than at the next retry is
+  unverified.
+- **The format-change rejection.** `winepulse` advertises 48000 Hz whatever the
+  sink's real rate is, so a sink reloaded at 44100 Hz still presents as 48000
+  and `SameFormat` accepts it. The branch has never run.
+- **The loopback endpoint-gone probe.** Wine keeps removed devices in the
+  enumerator and still reports them ACTIVE — visible in the runs above, where
+  rebuild attempts got all the way past `Activate` and failed only at
+  `Initialize`. So `EndpointStillActive` always answers yes here. Its
+  false-positive half was checked and passed; its true-positive half was not.
+- **The render's no-callback watchdog.** The cable always reported
+  `AUDCLNT_E_DEVICE_INVALIDATED` promptly, so `timeouts` stayed 0 and the three
+  quiet windows never accumulated.
+- **Sleep/wake and a real USB replug**, and the clock keeper against a real GC7
+  endpoint rather than a null sink.
+
+### On the machine, from spec §6.7
+
+1. **Sleep and wake.** Expect `stream lost: AUDCLNT_E_DEVICE_INVALIDATED -
+   rebuilding` and then `stream back after N s` on each affected stream, with
+   `rebuilt 1x` in the next report and no restart needed.
+2. **Unplug and replug the GC7.** The chat source should go `DOWN, rebuilding`
+   and come back. While it is down the render row must keep counting callbacks.
+3. **Leave it unplugged for a few minutes.** Retries should settle at 5 s and
+   the log at roughly a line a minute. Replugging should be picked up at once —
+   this is the notification path the rig could not test.
+4. **Lower Max Latency in `VBCABLE_ControlPanel.exe` while vcmic runs.** Expect
+   a rebuild and `cable render block is now N frames`.
+5. **`keep_chat_clock_alive = true`** (on in this machine's `config.toml`): with
+   Discord silent the chat row should hold `fill ~40 ms` with `silent packets`
+   climbing, instead of falling to `REFILLING`.

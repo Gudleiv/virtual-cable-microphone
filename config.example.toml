@@ -110,13 +110,27 @@ max_rate_correction = 0.001
 
 [resilience]
 # A USB DAC re-enumerates on sleep/wake and on replug. Each stream is rebuilt on
-# its own with exponential backoff between these bounds, while the render side
-# keeps running on silence so ShadowPlay never sees a gap.
+# its own with exponential backoff between these bounds, while the other two
+# keep running - a dead capture source is mixed as silence rather than stopping
+# the render, so ShadowPlay never sees the stream end.
+#
+# vcmic also subscribes to endpoint notifications, so a device that comes back
+# is usually picked up within milliseconds and these bounds only matter when a
+# notification is missed. The first retry after a stream dies is immediate; a
+# stream that dies again the moment it opens keeps backing off instead, so a
+# device that is broken rather than absent cannot turn recovery into a spin.
 backoff_min_ms = 100
 backoff_max_ms = 5000
 
 # Hold a silent render client open on the chat endpoint so its clock keeps
-# running even when nobody is talking. Try this if loopback capture stalls.
+# running even when nobody is talking.
+#
+# Worth turning on if the chat source keeps dropping to REFILLING, or reports
+# NO DATA while you know audio has been playing. An idle render endpoint stops
+# its engine, and WASAPI loopback on a stopped engine delivers no packets at
+# all - not even silent ones - so the ring drains until sound resumes. A
+# started render client of ours keeps the endpoint awake. It renders digital
+# silence, so nothing is audible and nothing about the device changes.
 keep_chat_clock_alive = false
 
 [log]

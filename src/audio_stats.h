@@ -51,6 +51,15 @@ struct SourceStats {
     // silence. The averaged fill and the correction stop moving then, so the
     // report has to say so rather than show figures that stopped being true.
     std::atomic<bool> primed{false};
+
+    // Resilience (spec 4.8, counted for the session dump of spec 4.11).
+    // `live` is false while the stream is gone and being rebuilt; `restarts`
+    // counts how many times it came back. `clock_keeper_faults` belongs to the
+    // optional silent render client of spec 4.9 and is separate because losing
+    // it degrades the loopback cadence without stopping the capture.
+    std::atomic<bool> live{false};
+    std::atomic<std::uint64_t> restarts{0};
+    std::atomic<std::uint64_t> clock_keeper_faults{0};
 };
 
 struct RenderStats {
@@ -58,6 +67,10 @@ struct RenderStats {
     std::atomic<std::uint64_t> frames{0};
     std::atomic<std::uint64_t> clipped_samples{0};
     std::atomic<std::uint64_t> timeouts{0};  // no render event within the wait window
+
+    // As above: false while the cable stream is being rebuilt (spec 4.8).
+    std::atomic<bool> live{false};
+    std::atomic<std::uint64_t> restarts{0};
 
     // Dynamics (spec 4.7). The "min gain" pair is written by the render thread
     // and reset by the reporter; the two can race, and the only consequence is
