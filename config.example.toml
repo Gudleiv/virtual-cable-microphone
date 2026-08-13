@@ -1,0 +1,134 @@
+# vcmic configuration.
+#
+# Copy this file to config.toml next to vcmic.exe and fill in the device ids.
+# Run `vcmic --list-devices` to get them, then `vcmic --check-config` to verify.
+#
+# Syntax: a small TOML subset - [sections], `key = value`, `#` or `;` comments,
+# quoted or bare values. No arrays and no nested tables.
+
+[devices]
+# Endpoint ids are the only stable identity: friendly names are localized and
+# change when the device is re-enumerated. Copy them verbatim, braces included.
+
+# Render endpoint that Discord plays into - the GC7 chat side, usually the
+# Default Communications Device. We capture it with WASAPI loopback, which does
+# not touch Discord's own path and adds no latency to it.
+chat_render_id = ""
+
+# Hardware microphone, opened in shared mode so Discord can keep using it.
+mic_capture_id = ""
+
+# VB-CABLE A *input* (render) endpoint. ShadowPlay then records the matching
+# CABLE-A *Output* (capture) endpoint as its microphone.
+output_render_id = ""
+
+# Optional fallbacks: case-insensitive substring of the friendly name, used only
+# when the id above is empty or no longer resolves. Matching by name logs a
+# warning on every start, so treat these as a safety net rather than a setting.
+chat_render_name = ""
+mic_capture_name = ""
+output_render_name = ""
+
+[audio]
+# All three endpoints must agree on this rate. There is no resampler yet, so a
+# mismatch is a hard error; fix it in VBCABLE_ControlPanel.exe (Internal Sample
+# Rate) and in the Windows device properties (Advanced -> Default Format).
+sample_rate = 48000
+require_sample_rate = true
+
+# Steady-state fill level of each capture ring, in milliseconds. This is the
+# dominant part of the added latency; drift correction pulls the fill level back
+# to this target. Lower is tighter but less tolerant of scheduling hiccups.
+#
+# Careful: the render thread takes a *whole* block out of each ring per
+# callback, so what a scheduling hiccup eats into is this value minus the
+# cable's block, not this value. VB-CABLE's default block is 22 ms, which leaves
+# nothing at all at 25 ms - hence the 40 ms default here. The better trade is to
+# shrink the block instead: Max Latency = 512 samples in
+# VBCABLE_ControlPanel.exe makes it 10.7 ms, and then 20 ms here is comfortable.
+# The startup log prints both numbers and warns when the margin gets thin.
+target_buffer_ms = 40.0
+
+# Total ring size. Keep it at several times target_buffer_ms so a scheduling
+# stall costs a bit of latency rather than an overrun.
+ring_capacity_ms = 250.0
+
+[mix]
+# Level of each source in the mixed virtual microphone, in dB.
+chat_gain_db = 0.0
+mic_gain_db = 0.0
+
+# Gain changes ramp over this time instead of stepping, to avoid clicks.
+gain_smoothing_ms = 10.0
+
+# Peak limiter on the sum, so that both of you talking at once cannot clip.
+# Attack is instantaneous and there is no lookahead, so nothing can overshoot
+# the threshold; the release is what keeps a caught peak from ducking the rest.
+limiter_enabled = true
+limiter_threshold_db = -1.0
+limiter_release_ms = 80.0
+
+[gate]
+# Optional noise gate on the microphone only - the chat side is never gated,
+# or your friends would disappear whenever you stopped talking. Off by default.
+#
+# threshold_db is the level that opens the gate; it stays open until the signal
+# falls 6 dB below that, which stops it chattering on a voice sitting right on
+# the threshold. attack/hold/release are the ramp up, the wait before closing
+# and the ramp down; the times are how long the ramp takes to cover ~95 %.
+enabled = false
+threshold_db = -45.0
+attack_ms = 5.0
+hold_ms = 120.0
+release_ms = 150.0
+
+[drift]
+# The three endpoints run on three independent clocks. At 100 ppm that is about
+# 360 ms of skew per hour, so correction is on by default: each ring is read
+# slightly faster or slower than the cable plays, with Catmull-Rom interpolation
+# in between, to hold its fill at target_buffer_ms. Hard drops and inserts stay
+# as an emergency fallback and are always counted as resyncs.
+enabled = true
+
+# How long the fill level is averaged before the loop acts on it. A single
+# reading jumps by a whole capture packet, so this has to be well above one.
+measure_window_s = 1.0
+
+# Time constant of the correction loop. This is the noise/speed trade: whatever
+# jitter survives measure_window_s comes back out as a wobble on the read rate
+# in proportion to 1/response_s. Measured against the target machine's own
+# timing noise, 10 s wobbles by about 90 ppm and reaches a new clock ratio in
+# ~10 s; 30 s wobbles by 30 ppm and takes 20-26 s; 45 s wobbles by 17 ppm and
+# takes ~35 s. 30 s is quiet enough that the logged drift figure means
+# something, and clock ratios do not change during a session anyway.
+response_s = 30.0
+
+# Largest read-rate correction allowed, as a fraction: 0.001 = 0.1 % = 1000 ppm.
+# A USB microphone is typically 100-300 ppm off, so this has room to spare. Set
+# it to 0 to bypass the resampler entirely and get the uncorrected path back.
+max_rate_correction = 0.001
+
+[resilience]
+# A USB DAC re-enumerates on sleep/wake and on replug. Each stream is rebuilt on
+# its own with exponential backoff between these bounds, while the render side
+# keeps running on silence so ShadowPlay never sees a gap.
+backoff_min_ms = 100
+backoff_max_ms = 5000
+
+# Hold a silent render client open on the chat endpoint so its clock keeps
+# running even when nobody is talking. Try this if loopback capture stalls.
+keep_chat_clock_alive = false
+
+[log]
+# trace|debug|info|warn|error|off
+level = "info"
+
+# Relative paths resolve next to vcmic.exe, not to the working directory.
+file = "vcmic.log"
+max_bytes = 2097152
+keep_files = 3
+console = true
+
+# How often the ring fill levels, drift correction and error counters are
+# summarised in the log. 0 disables the periodic report.
+stats_interval_s = 30

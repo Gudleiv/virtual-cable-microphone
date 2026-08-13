@@ -67,3 +67,6 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# config.toml is tracked on purpose: this is a single-machine tool and the
+# endpoint ids in it are the result of a device survey worth keeping.
