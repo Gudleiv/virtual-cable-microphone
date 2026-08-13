@@ -109,10 +109,30 @@ While running, vcmic logs a counter report every `log.stats_interval_s`
 seconds: the fill level of each ring and the drift correction being applied to
 it, plus underruns, overruns, resyncs, discontinuities, limiter activity and
 clipped samples. A healthy session shows a fill level sitting on
-`audio.target_buffer_ms`, a drift figure that settles within the first minute
-and then stays put, and zeros everywhere else. `corrected` is cumulative: it is
-the skew that would otherwise have accumulated, and it is expected to grow
-steadily.
+`audio.target_buffer_ms`, a drift figure that settles within the first half
+minute and then stays put, and zeros everywhere else. `corrected` is
+cumulative: it is the skew that would otherwise have accumulated, and it is
+expected to grow steadily.
+
+`drift` is reported as two numbers, because they answer different questions:
+
+```
+stats mic: fill 39.2 ms (avg 39.9), drift +92 ppm (+238 transient), corrected +70.8 ms
+```
+
+The headline is the clock ratio the loop has learned. It is a property of the
+hardware, it settles and then sits still, and it is the number to quote when
+asking how far apart two devices run. The figure in brackets is everything the
+loop is doing on top of that to absorb a disturbance — a device that handed
+over a lump of frames at once, or a scheduling stall. It is large and
+short-lived by design, and a source that keeps showing a big one is a source
+worth looking at: on this machine it tracks the `discontinuities` counter
+almost exactly.
+
+A source that has never delivered a packet says `NO DATA` rather than
+`REFILLING`. The two are not the same problem: WASAPI loopback emits nothing at
+all on a render endpoint nobody is playing into, so `NO DATA` on the chat row
+usually means the audio is going somewhere else, not that the ring is behind.
 
 ## How the audio path works
 
@@ -142,8 +162,10 @@ latency.
 
 The GC7's capture side, its render side and the cable each run on their own
 crystal, and none of them is the cable's. On this machine the microphone runs
-about 198 ppm fast, which is 713 ms of skew per hour — the whole reason
-`audio.target_buffer_ms` cannot simply be left to look after itself.
+about 88 ppm fast, which is 317 ms of skew per hour — the whole reason
+`audio.target_buffer_ms` cannot simply be left to look after itself. The GC7's
+render endpoint, by contrast, is within a few tens of ppm of the cable; it is
+the microphone that needs the correction.
 
 So the render thread reads each ring at a rate slightly different from the one
 it plays at, interpolating between input samples with a four-point Catmull-Rom

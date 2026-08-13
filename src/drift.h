@@ -118,6 +118,16 @@ public:
     double correction_ppm() const noexcept { return correction_ * 1.0e6; }
     double average_fill() const noexcept { return average_; }
 
+    // The two halves of that correction, which answer different questions. The
+    // integral term is the clock ratio the loop has learned, and it is the only
+    // one that means anything about the hardware: it moves slowly and settles.
+    // Everything else is the loop absorbing a disturbance - a source that
+    // delivered a lump of frames at once, or a scheduling stall - and it is
+    // large and short-lived by design. Reporting only their sum makes a device
+    // that hiccups once a minute look like a clock that cannot be measured.
+    double steady_ppm() const noexcept { return ki_ * integral_ * 1.0e6; }
+    double transient_ppm() const noexcept { return correction_ppm() - steady_ppm(); }
+
     // The clamped value actually in force, which is what the caller has to size
     // its input buffer against.
     double max_correction() const noexcept { return max_correction_; }

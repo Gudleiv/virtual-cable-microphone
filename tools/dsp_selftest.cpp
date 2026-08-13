@@ -128,6 +128,8 @@ struct LoopResult {
     double settled_ppm = 0.0;
     double mean_ppm = 0.0;      // what the accumulated correction actually works out to
     double ppm_stdev = 0.0;     // how much the applied rate wobbles around it
+    double steady_mean_ppm = 0.0;  // the same two figures for the integral term alone,
+    double steady_stdev = 0.0;     // which is what the log headlines
     double min_wake_ms = 1e9;   // fill the render thread sees; this is what is regulated
     double max_wake_ms = -1e9;
     double min_left_ms = 1e9;   // fill after the block was taken; this is what runs out
@@ -147,8 +149,13 @@ struct LoopResult {
 // a ten-minute session there showed the correction wobbling with a standard
 // deviation of 157 ppm, which at kp = 0.2 means about 0.8 ms of noise left on
 // the averaged fill.
+// `burst_frames` every `burst_period_s` models a device that withholds frames
+// and then hands them over in one lump, which is what the fifine microphone on
+// the target machine does about once a minute (WASAPI flags those packets
+// DATA_DISCONTINUITY). The lump stays in the ring, so the loop has to drain it.
 LoopResult RunLoop(double source_ppm, double minutes, const DriftConfig& config, double target_ms,
-                   double wander_frames = 320.0, std::size_t block = 1056) {
+                   double wander_frames = 320.0, std::size_t block = 1056,
+                   double burst_frames = 0.0, double burst_period_s = 0.0) {
     const std::size_t target = static_cast<std::size_t>(target_ms * kRate / 1000.0);
     const std::size_t max_frames = target * 4;
 
@@ -187,8 +194,12 @@ LoopResult RunLoop(double source_ppm, double minutes, const DriftConfig& config,
     LoopResult result;
     bool primed = true;
     double ppm_sum = 0.0, ppm_sum2 = 0.0;
+    double steady_sum = 0.0, steady_sum2 = 0.0;
     std::size_t ppm_count = 0;
     double min_avg = 1e9, max_avg = -1e9;
+
+    const std::size_t burst_every =
+        burst_period_s > 0.0 ? static_cast<std::size_t>(burst_period_s * kRate / block) : 0;
 
     const std::size_t callbacks =
         static_cast<std::size_t>(minutes * 60.0 * kRate / static_cast<double>(block));
@@ -196,6 +207,9 @@ LoopResult RunLoop(double source_ppm, double minutes, const DriftConfig& config,
     for (std::size_t c = 0; c < callbacks; ++c) {
         produced_exact += static_cast<double>(block) * rate;
         wander += (-wander * wander_decay) + kick(rng) * wander_kick * wander_decay;
+        if (burst_every > 0 && c > 0 && c % burst_every == 0) {
+            produced_exact += burst_frames;
+        }
         std::int64_t want = static_cast<std::int64_t>(produced_exact + wander) - produced_total +
                             jitter(rng);
         if (want < 0) want = 0;
@@ -247,6 +261,9 @@ LoopResult RunLoop(double source_ppm, double minutes, const DriftConfig& config,
             const double ppm = drift.correction_ppm();
             ppm_sum += ppm;
             ppm_sum2 += ppm * ppm;
+            const double steady = drift.steady_ppm();
+            steady_sum += steady;
+            steady_sum2 += steady * steady;
             ++ppm_count;
             const double avg_ms = 1000.0 * drift.average_fill() / kRate;
             if (avg_ms < min_avg) min_avg = avg_ms;
@@ -260,6 +277,10 @@ LoopResult RunLoop(double source_ppm, double minutes, const DriftConfig& config,
         const double variance = ppm_sum2 / static_cast<double>(ppm_count) -
                                 result.mean_ppm * result.mean_ppm;
         result.ppm_stdev = variance > 0.0 ? std::sqrt(variance) : 0.0;
+        result.steady_mean_ppm = steady_sum / static_cast<double>(ppm_count);
+        const double steady_variance = steady_sum2 / static_cast<double>(ppm_count) -
+                                       result.steady_mean_ppm * result.steady_mean_ppm;
+        result.steady_stdev = steady_variance > 0.0 ? std::sqrt(steady_variance) : 0.0;
         result.avg_fill_span_ms = max_avg - min_avg;
     }
     return result;
@@ -336,6 +357,31 @@ void TestControlLoop() {
           over.max_wake_ms);
     Check(over.resyncs > 0, "beyond the ceiling: resync valve fires",
           static_cast<double>(over.resyncs));
+
+    // A source that hands over a 10 ms lump of frames every 73 s on top of an
+    // 88 ppm clock, which is the shape of what the fifine microphone does on
+    // the target machine: two sessions there reported the total correction with
+    // a standard deviation near 190 ppm, unreadable even though the loop was
+    // tracking correctly. Splitting the report is what fixes that, so the split
+    // has to hold up under this disturbance.
+    //
+    // The lumps stay in the stream, so they are part of the rate the loop is
+    // supposed to find: 480 frames every 73 s is another 137 ppm on top of the
+    // 88, and the headline figure has to land on the sum, not on the clock.
+    constexpr double kLumpMs = 10.0, kLumpEvery = 73.0;
+    const double lumpy_true = 88.0 + 1000.0 * kLumpMs / kLumpEvery;
+    const LoopResult lumpy =
+        RunLoop(88.0, 30.0, config, kTargetMs, 320.0, 1056, kLumpMs * kRate / 1000.0, kLumpEvery);
+    Check(std::fabs(lumpy.steady_mean_ppm - lumpy_true) < 40.0,
+          "lumpy source: learned rate lands on the true one (ppm)", lumpy.steady_mean_ppm);
+    Check(lumpy.steady_stdev < lumpy.ppm_stdev / 3.0,
+          "lumpy source: headline figure at least 3x quieter than the total (ppm)",
+          lumpy.steady_stdev);
+    Check(lumpy.ppm_stdev > 100.0, "lumpy source: the total is as noisy as the machine reports (ppm)",
+          lumpy.ppm_stdev);
+    Check(lumpy.underruns == 0 && lumpy.resyncs == 0,
+          "lumpy source: absorbed without a glitch",
+          static_cast<double>(lumpy.underruns + lumpy.resyncs));
 }
 
 // ---------------------------------------------------------------------------

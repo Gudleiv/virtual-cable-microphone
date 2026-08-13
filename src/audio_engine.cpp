@@ -551,6 +551,8 @@ void RenderSink::PullSource(SourceState& state, std::size_t frames) noexcept {
         std::memory_order_relaxed);
     state.stats->drift_ppm.store(static_cast<std::int32_t>(state.drift.correction_ppm()),
                                  std::memory_order_relaxed);
+    state.stats->drift_steady_ppm.store(static_cast<std::int32_t>(state.drift.steady_ppm()),
+                                        std::memory_order_relaxed);
     state.stats->average_fill_frames.store(
         static_cast<std::uint32_t>(state.drift.average_fill() < 0.0 ? 0.0
                                                                    : state.drift.average_fill()),
@@ -893,11 +895,20 @@ void AudioEngine::LogCounters(const wchar_t* prefix) {
                                    FramesToMs(s.fill_frames.load(std::memory_order_relaxed),
                                               sample_rate_));
 
-        LogInfo(L"{} {}: {}, drift {}{:+} ppm, corrected {:+.1f} ms, "
+        // Headline the learned clock ratio and break out what the loop is
+        // absorbing on top of it, rather than printing only their sum: a device
+        // that hands over a lump of frames once a minute otherwise reads as a
+        // clock wandering by hundreds of ppm.
+        const std::int32_t total = s.drift_ppm.load(std::memory_order_relaxed);
+        const std::int32_t steady = s.drift_steady_ppm.load(std::memory_order_relaxed);
+        const std::wstring correction =
+            std::format(L"drift {}{:+} ppm ({:+} transient)", primed ? L"" : L"held at ", steady,
+                        total - steady);
+
+        LogInfo(L"{} {}: {}, {}, corrected {:+.1f} ms, "
                 L"frames {}, silent packets {}, discontinuities {}, underruns {} ({:.1f} ms), "
                 L"overruns {} ({:.1f} ms), resyncs {} ({:.1f} ms)",
-                prefix, role, level, primed ? L"" : L"held at ",
-                s.drift_ppm.load(std::memory_order_relaxed),
+                prefix, role, level, correction,
                 (drift < 0 ? -1.0 : 1.0) *
                     FramesToMs(static_cast<std::uint64_t>(drift < 0 ? -drift : drift), sample_rate_),
                 s.frames.load(std::memory_order_relaxed),

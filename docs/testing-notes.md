@@ -42,6 +42,7 @@ a heap overflow rather than a subtle glitch.
 | control loop, +198 / −198 / 0 / +900 ppm | learns +198.0 / −198.0 / +0.0 / +900.0 ppm, reached in 20-26 s |
 | control loop, one hour each | fill held at 50.19 ms against a 50 ms target, 7.6 ms span, zero resyncs, zero underruns |
 | correction wobble | 30 ppm, 1 sigma |
+| a source handing over a 10 ms lump every 73 s | headline figure lands on the true rate and wobbles by 28 ppm where the total wobbles by 181 |
 | the same hour with `drift.enabled = false` | 4 resyncs, i.e. one dropped backlog every ~12 minutes |
 | beyond the ceiling (5000 ppm) | correction saturates, resync valve fires, fill still bounded |
 | limiter | nothing exceeds the threshold, bit-transparent below it |
@@ -122,7 +123,48 @@ PulseAudio null sinks disagree by far more than any real hardware does:
   and past the correction ceiling. That makes it a good stress test of
   saturation and of the resync valve, but the loop is never asked to settle, so
   the convergence numbers come from the offline self-test instead. The real
-  figure for this hardware, +198 ppm on the fifine microphone against the cable
-  with the GC7 loopback effectively locked to it, was measured from the
-  `frames` counters of two live sessions on the target machine.
+  figures for this hardware were measured from the `frames` counters of live
+  sessions on the target machine; see below.
 - **Anything to do with device re-enumeration**, sleep/wake or USB replug.
+
+## The target machine, with both sources live
+
+A seven-minute session with audio playing into the GC7 headset endpoint and the
+microphone open is the one measurement that separates the control loop from the
+hardware, because both capture sources run identical code, on the same machine,
+at the same moment. They do not behave the same:
+
+| | chat (GC7 loopback) | microphone (fifine, USB) |
+|---|---|---|
+| reported correction, 1 sigma | **35 ppm** | 189 ppm |
+| swing of the averaged fill | **1.6 ms** | 9.5 ms |
+| `discontinuities` | 1, at stream start | 0.82 per minute |
+| clock against the cable | within a few tens of ppm | +88 ppm |
+
+The chat figure of 35 ppm is what `drift.response_s = 30` was chosen to deliver,
+so the loop does what the sweep said it would. Everything above that on the
+microphone row is the device, not the loop: splitting the intervals by whether
+`discontinuities` moved gives a mean correction of +280 ppm in the intervals
+where it did and −27 ppm in the intervals where it did not, with almost no
+overlap between the two populations. The microphone hands over a lump of frames
+roughly once a minute and the loop spends the following half-minute draining it.
+
+Two independent runs put the microphone's clock at +87 and +88 ppm, which
+supersedes an earlier estimate of +198 ppm: that one was taken from the
+accumulated correction, which also contains the lump absorption and therefore
+runs high.
+
+None of this costs anything audible — 25 minutes and 7 minutes both ended with
+zero underruns, overruns, resyncs and clipped samples — but it is why the log
+reports the learned rate and the absorption as separate numbers.
+
+Two behaviours worth recognising in a log, neither of them a fault:
+
+- When the chat endpoint goes idle, WASAPI delivers a few hundred milliseconds
+  of packets flagged `AUDCLNT_BUFFERFLAGS_SILENT` and then stops delivering
+  altogether. The ring drains, one underrun is counted for the shortfall, and
+  the source flips to refilling and is mixed as silence from then on. The
+  measured cost of that transition is a single 1.7 ms gap.
+- A source that has never delivered a packet reports `NO DATA`, not
+  `REFILLING`. On the chat row it means nothing is playing into that endpoint;
+  loopback on an idle render endpoint emits no packets at all, not silent ones.

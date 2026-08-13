@@ -44,7 +44,8 @@ struct SourceStats {
     // positive value means this source's clock runs fast and the extra frames
     // were resampled away rather than dropped.
     std::atomic<std::int64_t> drift_frames{0};
-    std::atomic<std::int32_t> drift_ppm{0};
+    std::atomic<std::int32_t> drift_ppm{0};         // total correction in force
+    std::atomic<std::int32_t> drift_steady_ppm{0};  // of which the learned clock ratio
     std::atomic<std::uint32_t> average_fill_frames{0};
 
     // False while the source is refilling to the target and being mixed as
