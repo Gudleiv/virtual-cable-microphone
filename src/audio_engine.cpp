@@ -71,6 +71,66 @@ std::wstring DescribeEndpoint(const EndpointInfo& info) {
     return std::format(L"{} [{}]", info.friendly_name, info.id);
 }
 
+// What both streams do before they diverge: resolve the endpoint, activate a
+// client, and take the endpoint's mix format - which in shared mode is the only
+// format that will be accepted, so it is also the one that has to be validated.
+// The two callers differ only in what they suggest when the rate is wrong.
+struct OpenedEndpoint {
+    ComPtr<IMMDevice> device;
+    ComPtr<IAudioClient> client;
+    EndpointInfo info;
+    MatchKind matched = MatchKind::None;
+    std::vector<std::uint8_t> format_blob;
+    FormatInfo format;
+    SampleFormat sample_format = SampleFormat::Unsupported;
+};
+
+HRESULT OpenEndpoint(IMMDeviceEnumerator* enumerator, EDataFlow flow,
+                     const DeviceSelector& selector, const AudioConfig& audio,
+                     const wchar_t* rate_hint, OpenedEndpoint& out, std::wstring& error) {
+    ResolvedDevice resolved;
+    HRESULT hr = ResolveDevice(enumerator, flow, selector, false, resolved, error);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    out.device = resolved.device;
+    out.info = resolved.info;
+    out.matched = resolved.matched;
+
+    hr = out.device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, out.client.PutVoid());
+    if (FAILED(hr)) {
+        error = std::format(L"Activate(IAudioClient) failed: {}", FormatHresult(hr));
+        return hr;
+    }
+
+    WAVEFORMATEX* mix = nullptr;
+    hr = out.client->GetMixFormat(&mix);
+    if (FAILED(hr) || mix == nullptr) {
+        error = std::format(L"GetMixFormat failed: {}", FormatHresult(hr));
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    const CoTaskMemPtr<WAVEFORMATEX> owned_format(mix);
+
+    out.format_blob = CloneFormat(mix);
+    out.format = InspectFormat(mix);
+    out.sample_format = ResolveSampleFormat(out.format);
+
+    if (out.sample_format == SampleFormat::Unsupported) {
+        error = std::format(L"unsupported mix format: {}", DescribeFormat(mix));
+        return E_FAIL;
+    }
+    if (audio.require_sample_rate && out.format.sample_rate != audio.sample_rate) {
+        error = std::format(L"runs at {} Hz but audio.sample_rate is {} Hz; {}",
+                            out.format.sample_rate, audio.sample_rate, rate_hint);
+        return E_FAIL;
+    }
+    if (out.format.channels == 0 || out.format.block_align == 0) {
+        error = L"mix format reports no channels";
+        return E_FAIL;
+    }
+    return S_OK;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- CaptureSource
@@ -85,48 +145,20 @@ CaptureSource::~CaptureSource() {
 
 HRESULT CaptureSource::Open(IMMDeviceEnumerator* enumerator, const DeviceSelector& selector,
                             const AudioConfig& audio, std::wstring& error) {
-    ResolvedDevice resolved;
-    HRESULT hr = ResolveDevice(enumerator, flow_, selector, false, resolved, error);
+    OpenedEndpoint opened;
+    HRESULT hr = OpenEndpoint(enumerator, flow_, selector, audio, L"there is no resampler yet",
+                              opened, error);
     if (FAILED(hr)) {
         return hr;
     }
-    device_ = resolved.device;
-    info_ = resolved.info;
-    matched_ = resolved.matched;
-
-    hr = device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client_.PutVoid());
-    if (FAILED(hr)) {
-        error = std::format(L"Activate(IAudioClient) failed: {}", FormatHresult(hr));
-        return hr;
-    }
-
-    WAVEFORMATEX* mix = nullptr;
-    hr = client_->GetMixFormat(&mix);
-    if (FAILED(hr) || mix == nullptr) {
-        error = std::format(L"GetMixFormat failed: {}", FormatHresult(hr));
-        return FAILED(hr) ? hr : E_FAIL;
-    }
-    CoTaskMemPtr<WAVEFORMATEX> owned_format(mix);
-
-    format_blob_ = CloneFormat(mix);
-    format_ = InspectFormat(mix);
-    sample_format_ = ResolveSampleFormat(format_);
+    device_ = std::move(opened.device);
+    client_ = std::move(opened.client);
+    info_ = std::move(opened.info);
+    matched_ = opened.matched;
+    format_blob_ = std::move(opened.format_blob);
+    format_ = opened.format;
+    sample_format_ = opened.sample_format;
     block_align_ = format_.block_align;
-
-    if (sample_format_ == SampleFormat::Unsupported) {
-        error = std::format(L"unsupported mix format: {}", DescribeFormat(mix));
-        return E_FAIL;
-    }
-    if (audio.require_sample_rate && format_.sample_rate != audio.sample_rate) {
-        error = std::format(
-            L"runs at {} Hz but audio.sample_rate is {} Hz; there is no resampler yet",
-            format_.sample_rate, audio.sample_rate);
-        return E_FAIL;
-    }
-    if (format_.channels == 0 || block_align_ == 0) {
-        error = L"mix format reports no channels";
-        return E_FAIL;
-    }
 
     downmix_ = BuildDownmix(format_);
 
@@ -319,49 +351,21 @@ double RenderSink::buffer_ms() const {
 
 HRESULT RenderSink::Open(IMMDeviceEnumerator* enumerator, const DeviceSelector& selector,
                          const AudioConfig& audio, std::wstring& error) {
-    ResolvedDevice resolved;
-    HRESULT hr = ResolveDevice(enumerator, eRender, selector, false, resolved, error);
+    OpenedEndpoint opened;
+    HRESULT hr = OpenEndpoint(enumerator, eRender, selector, audio,
+                              L"set Internal Sample Rate in VBCABLE_ControlPanel.exe", opened,
+                              error);
     if (FAILED(hr)) {
         return hr;
     }
-    device_ = resolved.device;
-    info_ = resolved.info;
-    matched_ = resolved.matched;
-
-    hr = device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client_.PutVoid());
-    if (FAILED(hr)) {
-        error = std::format(L"Activate(IAudioClient) failed: {}", FormatHresult(hr));
-        return hr;
-    }
-
-    WAVEFORMATEX* mix = nullptr;
-    hr = client_->GetMixFormat(&mix);
-    if (FAILED(hr) || mix == nullptr) {
-        error = std::format(L"GetMixFormat failed: {}", FormatHresult(hr));
-        return FAILED(hr) ? hr : E_FAIL;
-    }
-    CoTaskMemPtr<WAVEFORMATEX> owned_format(mix);
-
-    format_blob_ = CloneFormat(mix);
-    format_ = InspectFormat(mix);
-    sample_format_ = ResolveSampleFormat(format_);
+    device_ = std::move(opened.device);
+    client_ = std::move(opened.client);
+    info_ = std::move(opened.info);
+    matched_ = opened.matched;
+    format_blob_ = std::move(opened.format_blob);
+    format_ = opened.format;
+    sample_format_ = opened.sample_format;
     block_align_ = format_.block_align;
-
-    if (sample_format_ == SampleFormat::Unsupported) {
-        error = std::format(L"unsupported mix format: {}", DescribeFormat(mix));
-        return E_FAIL;
-    }
-    if (audio.require_sample_rate && format_.sample_rate != audio.sample_rate) {
-        error = std::format(
-            L"runs at {} Hz but audio.sample_rate is {} Hz; set Internal Sample Rate in "
-            L"VBCABLE_ControlPanel.exe",
-            format_.sample_rate, audio.sample_rate);
-        return E_FAIL;
-    }
-    if (format_.channels == 0 || block_align_ == 0) {
-        error = L"mix format reports no channels";
-        return E_FAIL;
-    }
 
     upmix_ = BuildUpmix(format_);
 
@@ -496,7 +500,6 @@ void RenderSink::PullSource(SourceState& state, std::size_t frames) noexcept {
         // The clock ratio the controller learned is still valid; only the
         // averaged fill describes a moment that has passed.
         state.drift.Resume(static_cast<double>(available));
-        state.stats->primings.fetch_add(1, std::memory_order_relaxed);
     }
     state.stats->primed.store(true, std::memory_order_relaxed);
 
@@ -941,8 +944,9 @@ void AudioEngine::LogCounters(const wchar_t* prefix) {
                                 percent(r.limiter_frames.load(std::memory_order_relaxed)));
     }
     if (cable_.gate().enabled()) {
-        r.gate_min_gain.store(kGainQ16One, std::memory_order_relaxed);
-        dynamics += std::format(L", gate attenuating {:.1f} % of frames",
+        const std::uint32_t deepest = r.gate_min_gain.exchange(kGainQ16One, std::memory_order_relaxed);
+        dynamics += std::format(L", gate {:.1f} dB deepest on {:.1f} % of frames",
+                                DbFromGain(GainFromQ16(deepest)),
                                 percent(r.gate_frames.load(std::memory_order_relaxed)));
     }
 

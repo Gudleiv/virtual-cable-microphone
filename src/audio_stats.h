@@ -36,7 +36,6 @@ struct SourceStats {
     std::atomic<std::uint64_t> underrun_frames{0};
     std::atomic<std::uint64_t> resyncs{0};         // consumer dropped a backlog to restore latency
     std::atomic<std::uint64_t> resync_frames{0};
-    std::atomic<std::uint64_t> primings{0};        // waits for the ring to reach the target fill
     std::atomic<std::uint32_t> fill_frames{0};     // most recent fill level seen by the render side
 
     // Drift compensation (spec 4.6). `drift_frames` is the accumulated

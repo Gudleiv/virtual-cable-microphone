@@ -67,7 +67,6 @@ public:
     T* operator->() const noexcept { return ptr_; }
     explicit operator bool() const noexcept { return ptr_ != nullptr; }
 
-    [[nodiscard]] T* Detach() noexcept { return std::exchange(ptr_, nullptr); }
 
 private:
     T* ptr_ = nullptr;

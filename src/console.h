@@ -16,11 +16,6 @@ void ConsoleOut(std::wstring_view text);
 void ConsoleErr(std::wstring_view text);
 
 template <class... Args>
-void Print(std::wformat_string<Args...> fmt, Args&&... args) {
-    ConsoleOut(std::format(fmt, std::forward<Args>(args)...));
-}
-
-template <class... Args>
 void PrintLine(std::wformat_string<Args...> fmt, Args&&... args) {
     ConsoleOut(std::format(fmt, std::forward<Args>(args)...));
     ConsoleOut(L"\n");
