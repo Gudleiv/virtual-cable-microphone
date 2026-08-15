@@ -46,15 +46,22 @@ The full specification is in [`docs/gc7-virtual-mic-spec.md`](docs/gc7-virtual-m
 | 1 | project skeleton, `--list-devices`, config parser, logging | **done** |
 | 2 | three streams, lock-free SPSC rings, mixing | **done** |
 | 3 | drift compensation, limiter, noise gate | **done** |
-| 4 | `IMMNotificationClient`, device-invalidation recovery, backoff | not started |
+| 4 | `IMMNotificationClient`, device-invalidation recovery, backoff | **done** |
 | 5 | tray icon, autostart | not started |
 
 Running `vcmic` with no mode option mixes chat and microphone into the cable
-until Ctrl+C, correcting for the three clocks as it goes. What is still missing
-is resilience: a USB DAC that re-enumerates on sleep/wake or replug currently
-stops its stream for good instead of rebuilding it. Stage 4 fixes that. See
+until Ctrl+C, correcting for the three clocks as it goes, and rebuilding any of
+the three streams that loses its device. It has no user interface yet: it is a
+console process, and it does not start itself at log on. See
 [`docs/testing-notes.md`](docs/testing-notes.md) for what has been measured and
 what has not.
+
+One thing stage 4 deliberately did not change: a device that is missing **at
+startup** is still a fatal error rather than something to wait for. Recovery
+covers devices that go away and come back, and telling a misconfigured id apart
+from an unplugged one is worth more at that moment than starting anyway. That
+will need revisiting in stage 5, where autostart at log on can easily win a race
+against a USB device enumerating.
 
 ## Requirements
 
@@ -193,6 +200,66 @@ The sum then goes through a peak limiter with no lookahead — the gain is never
 allowed above what the current sample permits, so nothing can overshoot the
 threshold — and an optional noise gate sits on the microphone alone.
 
+### When a device disappears
+
+A USB DAC re-enumerates on sleep/wake and whenever the cable is pulled, and the
+streams that were reading it die with `AUDCLNT_E_DEVICE_INVALIDATED`. Each of
+the three streams recovers on its own, on its own thread — the thread that owns
+those WASAPI objects is the only one that ever touches them, so a rebuild needs
+no lock anywhere near the audio path.
+
+- **Only the broken stream stops.** A capture source that is gone is mixed as
+  silence; the render keeps handing buffers to the cable, so ShadowPlay never
+  sees the microphone end. This matters more than it sounds: a gap in the stream
+  can look to ShadowPlay exactly like the device being removed.
+- **The first retry is immediate**, then 100 ms, 200 ms, 400 ms … up to 5 s.
+  A stream that comes back and dies again straight away keeps backing off
+  instead of resetting, so a device that is broken rather than absent cannot
+  turn recovery into a spin.
+- **Endpoint notifications cut the wait short.** `IMMNotificationClient` is not
+  used to drive recovery — those callbacks repeat, can be missed, and can arrive
+  before an endpoint can actually be opened. All they do is pulse the event the
+  broken stream is waiting on, so a replug is picked up in milliseconds instead
+  of at the end of a backoff. Correctness never depends on one arriving.
+- **A rebuilt endpoint has to come back with the same format.** The rings, the
+  converters and the mixer were all sized for it at startup, and re-sizing them
+  would mean stopping the render for one source's sake. If the sample rate or
+  channel count changed, the log says exactly what changed and the stream keeps
+  retrying until it is put back. The one exception is the cable's own block
+  length, which is the render thread's to resize: lowering Max Latency in
+  `VBCABLE_ControlPanel.exe` restarts the cable, and vcmic adopts the new block.
+- **A render that goes quiet is rebuilt too.** Three wait windows in a row with
+  no callback at all (6 s) means the clock master has stopped without reporting
+  a failure. There is no audio flowing at that point either way.
+- **A stream can outlive its device without a single call failing.** Remove a
+  capture endpoint and re-add it a moment later and the old client keeps
+  answering `S_OK` and delivering nothing, forever. So silence is watched as
+  well as errors: five seconds of no packets at all is proof enough on an
+  ordinary capture stream, because a live one always delivers, silence
+  included. On the loopback stream it proves nothing — an idle render endpoint
+  legitimately delivers no packets — so there the same five seconds only
+  prompts a question to the enumerator about whether the endpoint is still
+  there, which cannot be misread.
+
+Rebuilds are counted per stream and appear in the periodic report and the exit
+summary as `rebuilt Nx`, and a stream that is down at that moment reads `DOWN,
+rebuilding` instead of a fill level.
+
+### Idle chat endpoints, and `keep_chat_clock_alive`
+
+A render endpoint nobody is playing into stops its audio engine, and WASAPI
+loopback on a stopped engine delivers **no packets at all** — not even silent
+ones. So when Discord goes quiet, the chat ring drains, the source drops to
+`REFILLING`, and it costs one small underrun on the way down.
+
+Setting `resilience.keep_chat_clock_alive = true` holds a started render client
+of vcmic's own on that endpoint. It renders digital silence, so nothing is
+audible and nothing about the device changes, but the endpoint's clock keeps
+running and loopback keeps handing over silence — the ring stays at its target
+and the drift loop never has to reconverge. It is off by default because it is a
+real stream on somebody else's output device; it is on in this machine's
+`config.toml` because the logs showed exactly that idle behaviour.
+
 ### Setting it up
 
 `config.toml` in the repository root is already filled in for this machine from
@@ -283,6 +350,7 @@ docs/                   the specification this is built from
 src/
   main.cpp              command line, --list-devices, --check-config
   device_registry.*     endpoint enumeration, properties, id/name resolution
+  device_watcher.*      IMMNotificationClient: wakes a broken stream early
   audio_format.*        WAVEFORMATEXTENSIBLE inspection and formatting
   audio_engine.*        the three streams, the mixer and the render callback
   drift.*               fractional-rate reader and the fill-level control loop

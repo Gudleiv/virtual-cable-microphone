@@ -76,6 +76,27 @@ measure_window_s = 1.0
 response_s = 30.0
 max_rate_correction = 0.001
 
+[resilience]
+# Defaults, kept explicit because the GC7 is a USB device: it re-enumerates on
+# sleep/wake and on replug, and each stream then rebuilds itself between these
+# bounds. The endpoint notifications usually make the wait irrelevant - a
+# device that comes back wakes its stream in milliseconds - but the ceiling is
+# what applies if a notification is missed.
+backoff_min_ms = 100
+backoff_max_ms = 5000
+
+# Turned on for this machine, and this is the setting to undo first if anything
+# about the headset behaves oddly.
+#
+# The 2026-08-13 logs showed the chat endpoint going idle whenever Discord had
+# nothing to play: loopback then delivers no packets at all, not even silent
+# ones, so the chat ring drained, the source dropped back to REFILLING and cost
+# one underrun on the way. A silent render client of our own on that endpoint
+# keeps its clock running, so loopback keeps handing over silence and none of
+# that happens. What it renders is digital silence - inaudible, and the hardware
+# GameVoice Mix knob is not involved either way.
+keep_chat_clock_alive = true
+
 [log]
 level = "info"
 file = "vcmic.log"
