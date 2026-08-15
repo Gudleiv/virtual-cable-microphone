@@ -47,21 +47,22 @@ The full specification is in [`docs/gc7-virtual-mic-spec.md`](docs/gc7-virtual-m
 | 2 | three streams, lock-free SPSC rings, mixing | **done** |
 | 3 | drift compensation, limiter, noise gate | **done** |
 | 4 | `IMMNotificationClient`, device-invalidation recovery, backoff | **done** |
-| 5 | tray icon, autostart | not started |
+| 5 | tray icon, autostart | **done** |
 
 Running `vcmic` with no mode option mixes chat and microphone into the cable
 until Ctrl+C, correcting for the three clocks as it goes, and rebuilding any of
-the three streams that loses its device. It has no user interface yet: it is a
-console process, and it does not start itself at log on. See
-[`docs/testing-notes.md`](docs/testing-notes.md) for what has been measured and
-what has not.
+the three streams that loses its device. `vcmic --tray` does the same behind an
+icon in the notification area, and `vcmic --install-autostart` makes that happen
+at log on. See [`docs/testing-notes.md`](docs/testing-notes.md) for what has
+been measured and what has not.
 
-One thing stage 4 deliberately did not change: a device that is missing **at
-startup** is still a fatal error rather than something to wait for. Recovery
-covers devices that go away and come back, and telling a misconfigured id apart
-from an unplugged one is worth more at that moment than starting anyway. That
-will need revisiting in stage 5, where autostart at log on can easily win a race
-against a USB device enumerating.
+Stage 4 left a device missing **at startup** as a fatal error, on the grounds
+that telling a misconfigured id apart from an unplugged one is worth more at
+that moment than starting anyway. Autostart makes that distinction impossible to
+draw — at log on the USB stack is still enumerating — so stage 5 gives startup
+its own retry window, `resilience.startup_wait_s`, defaulting to a minute. Run
+by hand with `startup_wait_s = 0` and the old behaviour is back: a wrong id
+fails immediately instead of hanging about.
 
 ## Requirements
 
@@ -101,6 +102,7 @@ by default, so no redistributable is needed; pass
 
 ```
 vcmic                    run the mixer until Ctrl+C
+vcmic --tray             the same, with an icon in the notification area
 vcmic --list-devices     list every audio endpoint with id, roles and mix format
 vcmic --active-only ...  with --list-devices: hide disabled/unplugged endpoints
 vcmic --check-config     resolve the configured devices and validate formats
@@ -108,9 +110,17 @@ vcmic --config <path>    config file (default: config.toml next to the exe)
 vcmic --log-level <lvl>  trace|debug|info|warn|error|off
 vcmic --version
 vcmic --help
+
+vcmic --install-autostart      start vcmic --tray when this user logs on
+vcmic --logon-delay <s>        with --install-autostart, default 30
+vcmic --uninstall-autostart    remove it
+vcmic --autostart-status       print what is registered
 ```
 
 Exit codes: `0` success, `1` bad command line, `2` failure.
+
+Only one mixer runs per session. A second `vcmic` finds the first holding a
+named mutex and exits straight away rather than fighting it for the cable.
 
 While running, vcmic logs a counter report every `log.stats_interval_s`
 seconds: the fill level of each ring and the drift correction being applied to
@@ -294,11 +304,74 @@ To redo the survey after a hardware change:
 4. In ShadowPlay, select `CABLE-A Output` (the **capture** side) as the
    microphone, and keep separate audio tracks enabled.
 
-### Why this is not a Windows service
+### The tray icon
+
+`vcmic --tray` puts a microphone in the notification area, coloured by state:
+green when all three streams are up, amber while one is being rebuilt or
+something is muted, red when the mixer has stopped. The tooltip spells out
+which. Muted counts as amber on purpose — a forgotten mute produces a recording
+with half the audio missing, and the icon is the only thing that would have said
+so before the clip was already made.
+
+The menu has mute chat, mute microphone, reload config, write a counter report
+to the log now, open the log, open the config, and exit.
+
+Muting is a gain of zero rather than a bypass, so it rides the same
+`mix.gain_smoothing_ms` ramp as any other gain change and does not click.
+
+**Reload config** re-reads the file and applies what can be applied to a running
+engine: the two gains, the smoothing time, the limiter, the gate, the log level
+and the report interval. Anything that sized a buffer or opened a device —
+`[devices]`, `[audio]`, `[drift]`, `[resilience]`, the log file itself — is
+listed in the log and in a balloon as needing a restart, and the old values keep
+running. A config with errors is refused whole; nothing is applied by halves.
+
+The icon is drawn at run time rather than shipped as a resource, so it comes out
+at whatever `SM_CXSMICON` says and there is no `.ico` in the repository.
+
+Everything above happens on the main thread. The audio threads never touch a
+window, and the tray never touches WASAPI: mute reaches the render thread as one
+relaxed store, and a reload as one release/acquire flag, both read at a block
+boundary.
+
+### Autostart, and why this is not a Windows service
 
 Audio endpoints belong to the user's session. A service runs in Session 0 and
-sees no devices at all. Autostart belongs in Task Scheduler ("at log on") or in
-the `Run` key, so that the process lives in the interactive session.
+sees no devices at all. Autostart therefore belongs in Task Scheduler ("at log
+on"), so that the process lives in the interactive session.
+
+```powershell
+vcmic --install-autostart
+vcmic --autostart-status
+vcmic --uninstall-autostart
+```
+
+That registers a per-user task called `vcmic` in the root folder of
+`taskschd.msc`, running this executable with `--tray`. It needs no
+administrator rights: a task that runs as you, with an interactive token, is
+yours to create. If you started vcmic with `--config <path>`, that path is
+registered with it.
+
+Several of the scheduler's defaults are actively wrong for a resident audio
+mixer, and the installer overrides all of them:
+
+| Default | What it would do | Set to |
+|---|---|---|
+| `ExecutionTimeLimit` 3 days | kill a healthy mixer after 72 hours | unlimited |
+| `Priority` 7 | run the process at `BELOW_NORMAL_PRIORITY_CLASS` | 5, the normal class |
+| `DisallowStartIfOnBatteries` | never start on an unplugged laptop | off |
+| `StopIfGoingOnBatteries` | stop mid-session when the charger comes out | off |
+| `Hidden` off | flash a console window at every log on | on |
+| no restart on failure | a mixer that dies stays dead until you notice | 3 retries, one minute apart |
+
+`--logon-delay` (30 s by default) is the setting that matters most. At log on
+the USB stack is still enumerating and the sound card does not exist yet;
+`resilience.startup_wait_s` covers the same gap from the other end, so the two
+together mean a cold boot does not need a manual restart.
+
+Any setting the scheduler declines is printed as a warning rather than
+swallowed — a task that registers and then behaves in a way nothing in the
+config explains is worse than one that fails out loud.
 
 ## Configuration
 
@@ -348,7 +421,10 @@ CMakeLists.txt
 config.example.toml     annotated configuration template
 docs/                   the specification this is built from
 src/
-  main.cpp              command line, --list-devices, --check-config
+  main.cpp              command line, --list-devices, --check-config, autostart
+  session.*             the run loop: startup wait, message pump, tray callbacks
+  tray.*                the notification-area icon, its menu and its artwork
+  autostart.*           the Task Scheduler logon task
   device_registry.*     endpoint enumeration, properties, id/name resolution
   device_watcher.*      IMMNotificationClient: wakes a broken stream early
   audio_format.*        WAVEFORMATEXTENSIBLE inspection and formatting

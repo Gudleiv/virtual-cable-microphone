@@ -323,6 +323,7 @@ ConfigLoad LoadConfigFile(const std::filesystem::path& path) {
     reader.Integer(L"resilience.backoff_min_ms", c.resilience.backoff_min_ms, 10, 60000);
     reader.Integer(L"resilience.backoff_max_ms", c.resilience.backoff_max_ms, 10, 300000);
     reader.Bool(L"resilience.keep_chat_clock_alive", c.resilience.keep_chat_clock_alive);
+    reader.Integer(L"resilience.startup_wait_s", c.resilience.startup_wait_s, 0, 3600);
 
     reader.Level(L"log.level", c.log.level);
     reader.String(L"log.file", c.log.file);

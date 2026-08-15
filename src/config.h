@@ -63,6 +63,11 @@ struct ResilienceConfig {
     std::uint32_t backoff_min_ms = 100;
     std::uint32_t backoff_max_ms = 5000;
     bool keep_chat_clock_alive = false;  // spec 4.9: silent render client on the chat endpoint
+    // How long to keep retrying at startup when a configured device is not
+    // there yet. Once the streams are up, spec 4.8 takes over and retries
+    // forever; this covers the other end, where a logon start can easily beat
+    // USB enumeration. 0 restores the old behaviour of failing at once.
+    std::uint32_t startup_wait_s = 60;
 };
 
 struct LoggingConfig {

@@ -823,6 +823,7 @@ void RenderSink::Bind(CaptureSource& chat, CaptureSource& mic, const Config& con
     const std::size_t target = MsToFrames(config.audio.target_buffer_ms, rate);
 
     inv_rate_ = rate == 0 ? 0.0 : 1.0 / static_cast<double>(rate);
+    bind_rate_ = rate;
 
     const auto bind_one = [&](SourceState& state, CaptureSource& source, double gain_db) {
         state.ring = &source.ring();
@@ -833,8 +834,8 @@ void RenderSink::Bind(CaptureSource& chat, CaptureSource& mic, const Config& con
         // the backlog is latency nobody asked for, so it gets dropped.
         state.max_frames = (std::min)(state.target_frames * 4, source.ring().capacity() / 2);
         state.max_frames = (std::max)(state.max_frames, state.target_frames + 1);
-        state.gain_target = GainFromDb(gain_db);
-        state.gain_current = state.gain_target;
+        state.gain_target.store(GainFromDb(gain_db), std::memory_order_relaxed);
+        state.gain_current = state.gain_target.load(std::memory_order_relaxed);
 
         state.drift_enabled = config.drift.enabled && config.drift.max_rate_correction > 0.0;
         state.drift.Configure(static_cast<double>(state.target_frames), rate, config.drift);
@@ -848,6 +849,16 @@ void RenderSink::Bind(CaptureSource& chat, CaptureSource& mic, const Config& con
     limiter_.Configure(config.mix, rate);
 
     SizeBuffers();
+}
+
+void RenderSink::PublishLiveSettings(const Config& config) {
+    // Everything expensive - the exp() and pow() behind the coefficients -
+    // happens here, on whichever thread asked for the reload. The render thread
+    // only copies the result in.
+    pending_.limiter = PeakLimiter::SettingsFrom(config.mix, bind_rate_);
+    pending_.gate = NoiseGate::SettingsFrom(config.gate, bind_rate_);
+    pending_.gain_coeff = SmoothingCoefficient(config.mix.gain_smoothing_ms, bind_rate_);
+    pending_ready_.store(true, std::memory_order_release);
 }
 
 void RenderSink::SizeBuffers() {
@@ -974,6 +985,15 @@ void RenderSink::PullSource(SourceState& state, std::size_t frames) noexcept {
 }
 
 void RenderSink::MixInto(std::uint8_t* destination, std::size_t frames) noexcept {
+    // A reload waiting to be picked up (spec 4.12). Nothing is computed here,
+    // only copied, and only on the block that follows the click on the menu.
+    if (pending_ready_.load(std::memory_order_acquire)) {
+        limiter_.Adopt(pending_.limiter);
+        gate_.Adopt(pending_.gate);
+        gain_coeff_ = pending_.gain_coeff;
+        pending_ready_.store(false, std::memory_order_relaxed);
+    }
+
     PullSource(chat_, frames);
     PullSource(mic_, frames);
 
@@ -994,8 +1014,8 @@ void RenderSink::MixInto(std::uint8_t* destination, std::size_t frames) noexcept
 
     float chat_gain = chat_.gain_current;
     float mic_gain = mic_.gain_current;
-    const float chat_goal = chat_.gain_target;
-    const float mic_goal = mic_.gain_target;
+    const float chat_goal = chat_.gain_target.load(std::memory_order_relaxed);
+    const float mic_goal = mic_.gain_target.load(std::memory_order_relaxed);
     const float coeff = gain_coeff_;
 
     for (std::size_t i = 0; i < frames; ++i) {
@@ -1232,8 +1252,120 @@ HRESULT AudioEngine::Start(IMMDeviceEnumerator* enumerator, const Config& config
         watcher_.Reset();
     }
 
+    config_ = config;
     LogStartupSummary(config);
     return S_OK;
+}
+
+void AudioEngine::PushGains() {
+    // Mute is a gain of zero rather than a bypass, so the render thread ramps
+    // into and out of it over mix.gain_smoothing_ms and nothing clicks.
+    cable_.SetChatGain(chat_muted_ ? 0.0f : GainFromDb(config_.mix.chat_gain_db));
+    cable_.SetMicGain(mic_muted_ ? 0.0f : GainFromDb(config_.mix.mic_gain_db));
+}
+
+void AudioEngine::SetChatMuted(bool muted) {
+    if (chat_muted_ == muted) {
+        return;
+    }
+    chat_muted_ = muted;
+    PushGains();
+    LogInfo(L"chat {}", muted ? L"muted" : L"unmuted");
+}
+
+void AudioEngine::SetMicMuted(bool muted) {
+    if (mic_muted_ == muted) {
+        return;
+    }
+    mic_muted_ = muted;
+    PushGains();
+    LogInfo(L"microphone {}", muted ? L"muted" : L"unmuted");
+}
+
+void AudioEngine::ApplyLiveConfig(const Config& next, std::vector<std::wstring>& blocked) {
+    // Anything that sized a buffer, opened a device or started a thread cannot
+    // change under a running engine. Say which ones differ rather than
+    // pretending the reload took, or silently doing half of it.
+    const auto selector_differs = [](const DeviceSelector& a, const DeviceSelector& b) {
+        return a.id != b.id || a.name_contains != b.name_contains;
+    };
+    if (selector_differs(next.devices.chat_render, config_.devices.chat_render) ||
+        selector_differs(next.devices.mic_capture, config_.devices.mic_capture) ||
+        selector_differs(next.devices.output_render, config_.devices.output_render)) {
+        blocked.push_back(L"[devices]");
+    }
+    if (next.audio.sample_rate != config_.audio.sample_rate ||
+        next.audio.require_sample_rate != config_.audio.require_sample_rate ||
+        next.audio.target_buffer_ms != config_.audio.target_buffer_ms ||
+        next.audio.ring_capacity_ms != config_.audio.ring_capacity_ms) {
+        blocked.push_back(L"[audio]");
+    }
+    if (next.drift.enabled != config_.drift.enabled ||
+        next.drift.measure_window_s != config_.drift.measure_window_s ||
+        next.drift.response_s != config_.drift.response_s ||
+        next.drift.max_rate_correction != config_.drift.max_rate_correction) {
+        blocked.push_back(L"[drift]");
+    }
+    if (next.resilience.backoff_min_ms != config_.resilience.backoff_min_ms ||
+        next.resilience.backoff_max_ms != config_.resilience.backoff_max_ms ||
+        next.resilience.keep_chat_clock_alive != config_.resilience.keep_chat_clock_alive ||
+        next.resilience.startup_wait_s != config_.resilience.startup_wait_s) {
+        blocked.push_back(L"[resilience]");
+    }
+    if (next.log.file != config_.log.file || next.log.max_bytes != config_.log.max_bytes ||
+        next.log.keep_files != config_.log.keep_files || next.log.console != config_.log.console) {
+        blocked.push_back(L"[log] file, max_bytes, keep_files, console");
+    }
+
+    // What is left is a handful of numbers the audio path reads per block.
+    config_.mix = next.mix;
+    config_.gate = next.gate;
+    config_.log.level = next.log.level;
+    config_.log.stats_interval_s = next.log.stats_interval_s;
+
+    cable_.PublishLiveSettings(config_);
+    PushGains();
+    Logger::SetLevel(config_.log.level);
+
+    LogInfo(L"reloaded: chat {:+.1f} dB{}, mic {:+.1f} dB{}, smoothing {:.1f} ms, limiter {}, "
+            L"gate {}, log level {}",
+            config_.mix.chat_gain_db, chat_muted_ ? L" (muted)" : L"", config_.mix.mic_gain_db,
+            mic_muted_ ? L" (muted)" : L"", config_.mix.gain_smoothing_ms,
+            config_.mix.limiter_enabled ? L"on" : L"off", config_.gate.enabled ? L"on" : L"off",
+            LogLevelName(config_.log.level));
+    for (const std::wstring& section : blocked) {
+        LogWarn(L"reload: {} changed, but that needs a restart - still running the old values",
+                section);
+    }
+}
+
+EngineStatus AudioEngine::Status() const {
+    EngineStatus status;
+    status.running = running_;
+    status.chat_muted = chat_muted_;
+    status.mic_muted = mic_muted_;
+
+    const SourceStats& chat = chat_.stats();
+    const SourceStats& mic = mic_.stats();
+    const RenderStats& render = cable_.stats();
+
+    status.chat_live = chat.live.load(std::memory_order_relaxed);
+    status.mic_live = mic.live.load(std::memory_order_relaxed);
+    status.render_live = render.live.load(std::memory_order_relaxed);
+    status.chat_started = chat.packets.load(std::memory_order_relaxed) != 0;
+    status.mic_started = mic.packets.load(std::memory_order_relaxed) != 0;
+
+    status.restarts = chat.restarts.load(std::memory_order_relaxed) +
+                      mic.restarts.load(std::memory_order_relaxed) +
+                      render.restarts.load(std::memory_order_relaxed);
+    status.dropouts = chat.underruns.load(std::memory_order_relaxed) +
+                      mic.underruns.load(std::memory_order_relaxed) +
+                      chat.overruns.load(std::memory_order_relaxed) +
+                      mic.overruns.load(std::memory_order_relaxed) +
+                      render.timeouts.load(std::memory_order_relaxed);
+
+    status.faulted = FAILED(chat_.fault()) || FAILED(mic_.fault()) || FAILED(cable_.fault());
+    return status;
 }
 
 void AudioEngine::LogStartupSummary(const Config& config) {
@@ -1315,24 +1447,44 @@ void AudioEngine::LogStartupSummary(const Config& config) {
     }
 }
 
-void AudioEngine::Run(HANDLE stop_event, std::uint32_t stats_interval_s) {
-    constexpr DWORD kPollMs = 500;
-
+bool AudioEngine::StartThreads(HANDLE stop_event) {
     stop_event_ = stop_event;
     // Captures first, so the rings are already filling when the clock master
     // starts asking for frames.
     if (!chat_.StartThread(stop_event) || !mic_.StartThread(stop_event) ||
         !cable_.StartThread(stop_event)) {
         LogError(L"could not start the audio threads");
-        return;
+        return false;
     }
     running_ = true;
+    since_report_ms_ = 0;
+    PushGains();
+    return true;
+}
+
+bool AudioEngine::Tick(std::uint32_t elapsed_ms, std::uint32_t stats_interval_s) {
+    if (CheckFaults()) {
+        return false;
+    }
+    since_report_ms_ += elapsed_ms;
+    if (stats_interval_s != 0 && since_report_ms_ >= stats_interval_s * 1000) {
+        LogCounters(L"stats");
+        since_report_ms_ = 0;
+    }
+    return true;
+}
+
+void AudioEngine::Run(HANDLE stop_event, std::uint32_t stats_interval_s) {
+    constexpr DWORD kPollMs = 500;
+
+    if (!StartThreads(stop_event)) {
+        return;
+    }
     LogInfo(L"running; press Ctrl+C to stop");
 
-    DWORD since_report_ms = 0;
     for (;;) {
         const DWORD result = ::WaitForSingleObject(stop_event, kPollMs);
-        if (CheckFaults()) {
+        if (!Tick(kPollMs, stats_interval_s)) {
             break;
         }
         if (result == WAIT_OBJECT_0) {
@@ -1341,11 +1493,6 @@ void AudioEngine::Run(HANDLE stop_event, std::uint32_t stats_interval_s) {
         }
         if (result != WAIT_TIMEOUT) {
             break;
-        }
-        since_report_ms += kPollMs;
-        if (stats_interval_s != 0 && since_report_ms >= stats_interval_s * 1000) {
-            LogCounters(L"stats");
-            since_report_ms = 0;
         }
     }
 }

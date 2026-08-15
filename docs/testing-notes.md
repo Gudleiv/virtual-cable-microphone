@@ -20,9 +20,9 @@ Two portability details fall out of it and are worth keeping:
 
 ## Offline self-test
 
-`tools/dsp_selftest.cpp` exercises everything stage 3 added without any audio
-hardware at all — the drift and dynamics headers pull in no Windows API, so it
-compiles and runs anywhere:
+`tools/dsp_selftest.cpp` exercises everything stage 3 added, plus stage 5's live
+reconfiguration, without any audio hardware at all — the drift and dynamics
+headers pull in no Windows API, so it compiles and runs anywhere:
 
 ```sh
 g++ -std=c++20 -O1 -fsanitize=address,undefined -Isrc \
@@ -47,6 +47,7 @@ a heap overflow rather than a subtle glitch.
 | beyond the ceiling (5000 ppm) | correction saturates, resync valve fires, fill still bounded |
 | limiter | nothing exceeds the threshold, bit-transparent below it |
 | gate | −60 dBFS noise stays shut, −20 dBFS speech passes at unity |
+| live reload of the dynamics (stage 5) | a limiter mid-peak keeps holding it down across the reload, a gate open on a voice stays open, switching the limiter off gets out of the way, and `Configure` still resets a freshly opened stream |
 
 The timing noise in the simulated source is calibrated against the machine
 rather than invented. A ten-minute session there ran the loop at
@@ -308,3 +309,92 @@ the channels that would show it (`USB-USBHUB3-Analytic`,
 `DriverFrameworks-UserMode`) ship disabled — so finding nothing is the expected
 result whether or not the bus misbehaved. The decisive test is still a session
 with vcmic closed.
+
+## Stage 5: tray, autostart and the startup window
+
+Stage 5 is mostly user-interface, which the Wine rig turns out to cover better
+than it covers audio: `winepulse` cannot do loopback, but Wine's `user32`,
+`gdi32` and shell notification area are all real enough to exercise.
+
+### What ran here
+
+| Check | Result |
+|---|---|
+| cross-compile, `-Wall -Wextra` | every file clean, links against `taskschd`, `secur32`, `user32`, `gdi32`, `shell32` |
+| DSP self-test after splitting the dynamics coefficients from their state | every stage 1-3 check unchanged, plus four new ones for the reload |
+| `--help`, bad `--logon-delay` | usage printed, `--logon-delay 99999` rejected with exit 1 |
+| `--autostart-status` with nothing registered | "not registered", exit 0 |
+| `--install-autostart` | reaches `ITriggerCollection::Create`, which Wine answers `E_NOTIMPL` — see below |
+| startup wait, device that never appears | one WARN, then quiet, gave up at the 6 s deadline plus the last backoff, exit 2 |
+| second instance while the first was waiting | refused in 1 ms with "another vcmic is already mixing in this session" |
+| `--tray` against a device that never appears | icon created, state driven to Failed, balloon shown, 10 s grace, clean exit |
+
+The tray line is the interesting one: no `no tray icon:` warning appeared, which
+means `RegisterClassEx`, the hidden top-level window, `CreateDIBSection` +
+`CreateIconIndirect` for the runtime-drawn glyph, `Shell_NotifyIcon(NIM_ADD)` and
+`NIM_SETVERSION` at version 4 all succeeded, and the whole thing tore down
+without complaint.
+
+### Everything the scheduler path could not reach
+
+Wine implements `ITaskService` far enough to be useful and then stops. What
+*did* run: `CoCreateInstance`, `Connect`, `GetFolder`, `NewTask`,
+`get_RegistrationInfo` with both puts, `get_Principal` with all three, every
+`ITaskSettings` put in `ApplySettings`, `get_IdleSettings`, and `get_Triggers`.
+What did not: `ITriggerCollection::Create(TASK_TRIGGER_LOGON)` returns
+`E_NOTIMPL`, so the trigger, the action, `RegisterTaskDefinition` and the whole
+of `QueryAutostart`'s read-back are unverified.
+
+That is also why the task is built through the object model rather than as XML
+handed to `put_XmlText`. The XML route is less code, but its schema cares about
+element order in ways that are easy to get subtly wrong, and the failure would
+land on the target machine at registration time. Every object-model call is a
+named method instead, so a mistake is a compile error in the MSVC build rather
+than a runtime surprise.
+
+One deliberate consequence: `ApplySettings` collects the `put_` calls the
+scheduler declines and the caller prints them as warnings. A task that registers
+and then behaves in a way nothing in the config explains is worse than one that
+fails out loud.
+
+`mingw-w64`'s `taskschd.h` stops short of `ILogonTrigger` — every other
+interface used here is present. Rather than lose the cross-compile check over
+one missing declaration, `autostart.cpp` declares it behind
+`#ifndef __ILogonTrigger_INTERFACE_DEFINED__`, the guard macro the generated
+headers define themselves, so MSVC never compiles a line of it.
+
+### The icon
+
+The glyph is computed rather than shipped: a capsule, a cradle arc and a stand,
+sampled 4×4 per pixel into a premultiplied BGRA DIB. Drawing it with GDI would
+have been shorter and wrong — GDI leaves the alpha channel alone, and the
+notification area composites with it.
+
+It was checked by rendering the same shape function on the host at 16, 24, 32
+and 64 pixels over both a light and a dark background. The first attempt read as
+a tree: the capsule was nearly circular and the base nearly as wide as it. The
+cradle arc, worth about 1.2 px at 16, is what makes the silhouette read as a
+microphone at the size that actually matters.
+
+### On the machine, for stage 5
+
+1. **`--install-autostart`, then `--autostart-status`.** Everything in that
+   output comes back from the scheduler rather than from what was just sent, so
+   it doubles as the read-back test. Check the delay, the command and that it
+   runs as the right account. `taskschd.msc` should show it in the root folder.
+2. **Log out and back in.** The icon should appear about `--logon-delay` seconds
+   later, green, with no console window flashing on the way. The log will say
+   how many attempts the devices took — that number is the one that says whether
+   30 s is enough on this machine.
+3. **Reboot with the GC7 unplugged**, plug it in during the startup window, and
+   confirm it starts anyway rather than exiting.
+4. **Mute chat, then mute the microphone**, and confirm both in a recording as
+   well as in the icon colour. The mute rides the gain smoothing, so it should
+   be inaudible rather than a click.
+5. **Reload config** after editing a gain, and separately after editing a device
+   id. The first should take effect on the next word spoken; the second should
+   refuse with a balloon and keep mixing on the old values.
+6. **Restart explorer** (`taskkill /f /im explorer.exe`, then start it again).
+   The icon should come back on its own.
+7. **Shut Windows down with vcmic running** and check the log ends with the
+   session summary rather than stopping mid-line.

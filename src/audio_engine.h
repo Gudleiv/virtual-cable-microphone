@@ -97,6 +97,7 @@ public:
     StereoRing& ring() { return ring_; }
     const StereoRing& ring() const { return ring_; }
     SourceStats& stats() { return stats_; }
+    const SourceStats& stats() const { return stats_; }
     HRESULT fault() const { return fault_.load(std::memory_order_relaxed); }
 
 private:
@@ -187,6 +188,20 @@ public:
     bool StartThread(HANDLE stop_event);
     void JoinThread();
 
+    // Control side (the tray, spec 4.12). A gain is a single relaxed store the
+    // render thread reads once per block and then ramps to over the configured
+    // smoothing time, so muting is click-free and costs the audio path nothing.
+    void SetChatGain(float gain) noexcept {
+        chat_.gain_target.store(gain, std::memory_order_relaxed);
+    }
+    void SetMicGain(float gain) noexcept {
+        mic_.gain_target.store(gain, std::memory_order_relaxed);
+    }
+
+    // Hands the render thread a new set of dynamics coefficients, computed
+    // here rather than there. Picked up at the next block boundary.
+    void PublishLiveSettings(const Config& config);
+
     const EndpointInfo& info() const { return info_; }
     const FormatInfo& format() const { return format_; }
     std::wstring FormatDescription() const { return DescribeFormat(AsWaveFormat(format_blob_)); }
@@ -200,6 +215,7 @@ public:
     const NoiseGate& gate() const { return gate_; }
 
     RenderStats& stats() { return stats_; }
+    const RenderStats& stats() const { return stats_; }
     HRESULT fault() const { return fault_.load(std::memory_order_relaxed); }
 
 private:
@@ -213,7 +229,9 @@ private:
         std::size_t target_frames = 0;
         std::size_t max_frames = 0;
         float gain_current = 1.0f;
-        float gain_target = 1.0f;
+        // Written by the control thread, read once per block by the render
+        // thread; the per-sample ramp towards it lives in `gain_current`.
+        std::atomic<float> gain_target{1.0f};
 
         bool drift_enabled = false;
         DriftController drift;
@@ -266,10 +284,30 @@ private:
     std::uint32_t block_align_ = 0;
     std::uint32_t buffer_frames_ = 0;
 
+    // What a config reload replaces. Filled in by the control thread, adopted
+    // by the render thread at a block boundary: one writer, one reader, a
+    // release/acquire flag between them and nothing to allocate or lock.
+    //
+    // Two reloads inside one render block could overwrite a set the render
+    // thread is mid-way through copying. The only writer is a menu click, the
+    // block is a few milliseconds, and the worst case is one block that mixes
+    // old and new coefficients - all of them valid numbers. Making it airtight
+    // would mean the control thread waiting on the audio thread, which is a far
+    // worse trade: a stream that is down would never clear the flag.
+    struct LiveSettings {
+        PeakLimiter::Settings limiter;
+        NoiseGate::Settings gate;
+        float gain_coeff = 1.0f;
+    };
+
     SourceState chat_;
     SourceState mic_;
     float gain_coeff_ = 1.0f;
     double inv_rate_ = 0.0;  // seconds per frame, so the audio path never divides
+    std::uint32_t bind_rate_ = 48000;  // the rate the control thread computes against
+
+    LiveSettings pending_{};
+    std::atomic<bool> pending_ready_{false};
 
     NoiseGate gate_;
     PeakLimiter limiter_;
@@ -282,6 +320,29 @@ private:
     std::atomic<HRESULT> fault_{S_OK};  // only what a rebuild cannot fix
 };
 
+// What the tray shows without having to know anything about WASAPI. Read from
+// the counters, which is why it is a snapshot rather than a reference: the
+// numbers move underneath the caller.
+struct EngineStatus {
+    bool running = false;
+    bool faulted = false;  // a stream stopped in a way no rebuild can fix
+
+    bool chat_live = false;    // stream up, as opposed to being rebuilt
+    bool mic_live = false;
+    bool render_live = false;
+    bool chat_started = false;  // has delivered at least one packet, ever
+    bool mic_started = false;
+
+    bool chat_muted = false;
+    bool mic_muted = false;
+
+    std::uint64_t restarts = 0;  // all three streams together
+    // Everything that put a hole in the output: ring underruns and overruns on
+    // either source, plus render callbacks that never arrived. Summed because
+    // the tooltip has room for one number, and the log has room for all of them.
+    std::uint64_t dropouts = 0;
+};
+
 class AudioEngine {
 public:
     AudioEngine();
@@ -292,25 +353,54 @@ public:
 
     HRESULT Start(IMMDeviceEnumerator* enumerator, const Config& config, std::wstring& error);
 
+    // Starts the three audio threads. Split out from Run() so that a caller
+    // with a message loop of its own - the tray - can own the waiting.
+    bool StartThreads(HANDLE stop_event);
+
+    // Housekeeping, expected about twice a second: reports the counters when
+    // the interval is up and checks for a fault. False means stop.
+    bool Tick(std::uint32_t elapsed_ms, std::uint32_t stats_interval_s);
+
     // Blocks until stop_event is signalled or a thread hits something a rebuild
     // cannot fix, logging the periodic counter report in between.
     void Run(HANDLE stop_event, std::uint32_t stats_interval_s);
 
     void Stop();
     void LogSummary();
+    void LogStatus() { LogCounters(L"status"); }
+
+    // Control surface for the tray (spec 4.12). All of it is safe to call from
+    // another thread while the engine runs.
+    void SetChatMuted(bool muted);
+    void SetMicMuted(bool muted);
+    bool chat_muted() const { return chat_muted_; }
+    bool mic_muted() const { return mic_muted_; }
+
+    // Applies what a reloaded config can change without a restart: mix gains,
+    // limiter, gate, log level and the report interval. Everything else is
+    // described in `blocked` and left alone.
+    void ApplyLiveConfig(const Config& next, std::vector<std::wstring>& blocked);
+
+    const Config& config() const { return config_; }
+    EngineStatus Status() const;
 
 private:
     void LogStartupSummary(const Config& config);
     void LogCounters(const wchar_t* prefix);
     bool CheckFaults();
+    void PushGains();
 
     CaptureSource chat_{L"chat", eRender, true};
     CaptureSource mic_{L"mic", eCapture, false};
     RenderSink cable_;
     ComPtr<DeviceWatcher> watcher_;
     HANDLE stop_event_ = nullptr;  // owned by the caller, signalled here to unblock the threads
+    Config config_;                // as running now, with any live reload folded in
     std::uint32_t sample_rate_ = 48000;
+    std::uint32_t since_report_ms_ = 0;
     bool running_ = false;
+    bool chat_muted_ = false;
+    bool mic_muted_ = false;
     bool chat_fault_reported_ = false;
     bool mic_fault_reported_ = false;
 };

@@ -34,10 +34,22 @@ float RampCoefficient(double ms, std::uint32_t rate) noexcept { return OnePole(m
 
 // ------------------------------------------------------------------ PeakLimiter
 
+PeakLimiter::Settings PeakLimiter::SettingsFrom(const MixConfig& mix, std::uint32_t rate) {
+    Settings settings;
+    settings.enabled = mix.limiter_enabled;
+    settings.threshold = GainFromDb(mix.limiter_threshold_db);
+    settings.release = RampCoefficient(mix.limiter_release_ms, rate);
+    return settings;
+}
+
+void PeakLimiter::Adopt(const Settings& settings) noexcept {
+    enabled_ = settings.enabled;
+    threshold_ = settings.threshold;
+    release_ = settings.release;
+}
+
 void PeakLimiter::Configure(const MixConfig& mix, std::uint32_t rate) {
-    enabled_ = mix.limiter_enabled;
-    threshold_ = GainFromDb(mix.limiter_threshold_db);
-    release_ = RampCoefficient(mix.limiter_release_ms, rate);
+    Adopt(SettingsFrom(mix, rate));
     Reset();
 }
 
@@ -88,14 +100,32 @@ DynamicsBlock PeakLimiter::Process(float* left, float* right, std::size_t frames
 
 // -------------------------------------------------------------------- NoiseGate
 
+NoiseGate::Settings NoiseGate::SettingsFrom(const GateConfig& gate, std::uint32_t rate) {
+    Settings settings;
+    settings.enabled = gate.enabled;
+    settings.open_threshold = GainFromDb(gate.threshold_db);
+    settings.close_threshold = GainFromDb(gate.threshold_db - kHysteresisDb);
+    settings.attack = RampCoefficient(gate.attack_ms, rate);
+    settings.release = RampCoefficient(gate.release_ms, rate);
+    settings.detector = RampCoefficient(kDetectorDecayMs, rate);
+    settings.hold_frames = static_cast<std::uint32_t>(gate.hold_ms * rate / 1000.0);
+    return settings;
+}
+
+void NoiseGate::Adopt(const Settings& settings) noexcept {
+    // Turning the gate on mid-session starts it from wide open and lets the
+    // release close it, which is quieter than snapping shut on the first block.
+    enabled_ = settings.enabled;
+    open_threshold_ = settings.open_threshold;
+    close_threshold_ = settings.close_threshold;
+    attack_ = settings.attack;
+    release_ = settings.release;
+    detector_ = settings.detector;
+    hold_frames_ = settings.hold_frames;
+}
+
 void NoiseGate::Configure(const GateConfig& gate, std::uint32_t rate) {
-    enabled_ = gate.enabled;
-    open_threshold_ = GainFromDb(gate.threshold_db);
-    close_threshold_ = GainFromDb(gate.threshold_db - kHysteresisDb);
-    attack_ = RampCoefficient(gate.attack_ms, rate);
-    release_ = RampCoefficient(gate.release_ms, rate);
-    detector_ = RampCoefficient(kDetectorDecayMs, rate);
-    hold_frames_ = static_cast<std::uint32_t>(gate.hold_ms * rate / 1000.0);
+    Adopt(SettingsFrom(gate, rate));
     Reset();
 }
 

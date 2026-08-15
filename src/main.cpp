@@ -1,5 +1,5 @@
-#include "audio_engine.h"
 #include "audio_format.h"
+#include "autostart.h"
 #include "com.h"
 #include "config.h"
 #include "console.h"
@@ -7,10 +7,14 @@
 #include "hresult.h"
 #include "logging.h"
 #include "paths.h"
+#include "session.h"
 #include "strings.h"
 #include "version.h"
 #include "win_headers.h"
 
+#include <cstdint>
+#include <cstdlib>
+#include <cwchar>
 #include <optional>
 #include <string>
 #include <vector>
@@ -22,12 +26,24 @@ constexpr int kExitOk = 0;
 constexpr int kExitUsage = 1;
 constexpr int kExitFailure = 2;
 
+// Spec 4.2 again: the autostart task lives in the user's session, so the guard
+// against a second copy is per-session too. Two mixers on one cable would each
+// render half the frames and neither would sound right.
+constexpr const wchar_t* kSingletonName = L"Local\\vcmic.mixer";
+
+constexpr std::uint32_t kDefaultAutostartDelayS = 30;
+
 struct Options {
     bool list_devices = false;
     bool check_config = false;
     bool show_help = false;
     bool show_version = false;
     bool active_only = false;
+    bool tray = false;
+    bool install_autostart = false;
+    bool uninstall_autostart = false;
+    bool autostart_status = false;
+    std::uint32_t autostart_delay_s = kDefaultAutostartDelayS;
     std::optional<LogLevel> log_level;
     std::filesystem::path config_path;
 };
@@ -44,8 +60,17 @@ void PrintUsage() {
     PrintLine(L"      --check-config     resolve the configured devices and validate their formats");
     PrintLine(L"  -c, --config <path>    config file (default: config.toml next to the exe)");
     PrintLine(L"      --log-level <lvl>  trace|debug|info|warn|error|off, overrides the config");
+    PrintLine(L"  -t, --tray             run with an icon in the notification area");
     PrintLine(L"  -v, --version          print the version and exit");
     PrintLine(L"  -h, --help             print this help and exit");
+    PrintLine();
+    PrintLine(L"Autostart (a per-user Task Scheduler job; no administrator rights needed):");
+    PrintLine(L"      --install-autostart    start vcmic --tray when this user logs on");
+    PrintLine(L"      --logon-delay <s>      with --install-autostart: wait this many seconds");
+    PrintLine(L"                             after logon, so USB enumeration finishes first");
+    PrintLine(L"                             (default {})", kDefaultAutostartDelayS);
+    PrintLine(L"      --uninstall-autostart  remove that job");
+    PrintLine(L"      --autostart-status     print what is currently registered");
     PrintLine();
     PrintLine(L"Fill config.toml from the ids printed by --list-devices, then run --check-config.");
 }
@@ -68,6 +93,26 @@ bool ParseArguments(int argc, wchar_t** argv, Options& options, std::wstring& er
             options.active_only = true;
         } else if (arg == L"--check-config") {
             options.check_config = true;
+        } else if (arg == L"-t" || arg == L"--tray") {
+            options.tray = true;
+        } else if (arg == L"--install-autostart") {
+            options.install_autostart = true;
+        } else if (arg == L"--uninstall-autostart") {
+            options.uninstall_autostart = true;
+        } else if (arg == L"--autostart-status") {
+            options.autostart_status = true;
+        } else if (arg == L"--logon-delay") {
+            std::wstring value;
+            if (!next(L"--logon-delay", value)) {
+                return false;
+            }
+            wchar_t* end = nullptr;
+            const unsigned long seconds = std::wcstoul(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != L'\0' || seconds > 3600) {
+                error = std::format(L"--logon-delay wants 0..3600 seconds, not '{}'", value);
+                return false;
+            }
+            options.autostart_delay_s = static_cast<std::uint32_t>(seconds);
         } else if (arg == L"-c" || arg == L"--config") {
             std::wstring value;
             if (!next(L"--config", value)) {
@@ -346,7 +391,81 @@ int RunCheckConfig(const Config& config, const std::filesystem::path& config_pat
     return ok ? kExitOk : kExitFailure;
 }
 
-// Signalled by the console control handler and by AudioEngine::Stop().
+void PrintAutostartInfo(const AutostartInfo& info) {
+    if (!info.installed) {
+        PrintLine(L"autostart: not registered");
+        PrintLine(L"  run 'vcmic --install-autostart' to start the mixer at logon");
+        return;
+    }
+
+    PrintLine(L"autostart: registered as the task '\\{}'", kAutostartTaskName);
+    PrintLine(L"  state       : {}{}", info.state.empty() ? L"?" : info.state,
+              info.enabled ? L"" : L"   (disabled)");
+    PrintLine(L"  runs as     : {}", info.user.empty() ? L"?" : info.user);
+    PrintLine(L"  command     : {} {}", info.command, info.arguments);
+    PrintLine(L"  logon delay : {} s", info.delay_s);
+    if (!info.last_run.empty()) {
+        PrintLine(L"  last run    : {}   (exit code {})", info.last_run, info.last_result);
+    }
+    PrintLine(L"  edit or remove it in taskschd.msc, or with 'vcmic --uninstall-autostart'");
+}
+
+int RunAutostart(const Options& options) {
+    std::wstring error;
+
+    if (options.uninstall_autostart) {
+        const HRESULT hr = RemoveAutostart(error);
+        if (FAILED(hr)) {
+            PrintErrLine(L"error: {}", error);
+            return kExitFailure;
+        }
+        PrintLine(L"{}", hr == S_FALSE ? L"autostart was not registered; nothing to remove"
+                                       : L"autostart removed");
+        return kExitOk;
+    }
+
+    if (options.install_autostart) {
+        // The task runs the same executable with --tray, plus whatever config
+        // this invocation was pointed at: installing with -c and then starting
+        // without it would silently mix a different pair of devices.
+        std::wstring arguments = L"--tray";
+        if (!options.config_path.empty()) {
+            arguments += std::format(L" --config \"{}\"", options.config_path.wstring());
+        }
+
+        std::vector<std::wstring> notes;
+        const HRESULT hr = InstallAutostart(options.autostart_delay_s, arguments, notes, error);
+        if (FAILED(hr)) {
+            PrintErrLine(L"error: {}", error);
+            return kExitFailure;
+        }
+        PrintLine(L"autostart registered.");
+        for (const std::wstring& note : notes) {
+            PrintErrLine(L"warning: the scheduler did not accept {}", note);
+        }
+        PrintLine();
+    }
+
+    AutostartInfo info;
+    const HRESULT hr = QueryAutostart(info, error);
+    if (FAILED(hr)) {
+        PrintErrLine(L"error: {}", error);
+        return kExitFailure;
+    }
+    PrintAutostartInfo(info);
+
+    if (options.install_autostart) {
+        PrintLine();
+        PrintLine(L"The delay matters: at logon the USB stack is often still enumerating, and the");
+        PrintLine(L"mixer cannot open a sound card that is not there yet. resilience.startup_wait_s");
+        PrintLine(L"in the config keeps it retrying after that, so the two cover the same gap from");
+        PrintLine(L"either end.");
+    }
+    return kExitOk;
+}
+
+// Signalled by the console control handler, by the tray's Exit and by a
+// Windows shutdown.
 HANDLE g_stop_event = nullptr;
 
 BOOL WINAPI ConsoleControlHandler(DWORD type) {
@@ -365,7 +484,41 @@ BOOL WINAPI ConsoleControlHandler(DWORD type) {
     }
 }
 
-int RunEngine(const Config& config) {
+// Refuses to be the second mixer in this session. Held for the lifetime of the
+// process; the kernel drops it if we die without cleaning up.
+class SingleInstance {
+public:
+    SingleInstance() = default;
+    ~SingleInstance() {
+        if (handle_ != nullptr) {
+            ::CloseHandle(handle_);
+        }
+    }
+
+    SingleInstance(const SingleInstance&) = delete;
+    SingleInstance& operator=(const SingleInstance&) = delete;
+
+    bool Acquire(const wchar_t* name) {
+        handle_ = ::CreateMutexW(nullptr, TRUE, name);
+        if (handle_ == nullptr) {
+            return true;  // cannot tell; better to run than to refuse
+        }
+        return ::GetLastError() != ERROR_ALREADY_EXISTS;
+    }
+
+private:
+    HANDLE handle_ = nullptr;
+};
+
+int RunEngine(const Config& config, const Options& options,
+              const std::filesystem::path& config_path, const std::filesystem::path& log_file) {
+    SingleInstance singleton;
+    if (!singleton.Acquire(kSingletonName)) {
+        LogError(L"another vcmic is already mixing in this session; this one is exiting");
+        PrintErrLine(L"error: vcmic is already running in this session");
+        return kExitFailure;
+    }
+
     ComPtr<IMMDeviceEnumerator> enumerator;
     HRESULT hr = CreateDeviceEnumerator(enumerator);
     if (FAILED(hr)) {
@@ -380,20 +533,11 @@ int RunEngine(const Config& config) {
     }
     ::SetConsoleCtrlHandler(ConsoleControlHandler, TRUE);
 
-    int exit_code = kExitOk;
-    {
-        AudioEngine engine;
-        std::wstring error;
-        hr = engine.Start(enumerator.Get(), config, error);
-        if (FAILED(hr)) {
-            LogError(L"{}", error);
-            exit_code = kExitFailure;
-        } else {
-            engine.Run(g_stop_event, config.log.stats_interval_s);
-            engine.Stop();
-            engine.LogSummary();
-        }
-    }
+    SessionOptions session;
+    session.tray = options.tray;
+    session.config_path = config_path;
+    session.log_file = log_file;
+    const int exit_code = RunMixerSession(enumerator.Get(), config, session, g_stop_event);
 
     ::SetConsoleCtrlHandler(ConsoleControlHandler, FALSE);
     ::CloseHandle(g_stop_event);
@@ -431,6 +575,11 @@ int Run(int argc, wchar_t** argv) {
         // No config and no log file needed just to print the endpoint table.
         return RunListDevices(options);
     }
+    if (options.install_autostart || options.uninstall_autostart || options.autostart_status) {
+        // Same: registering a scheduled task says nothing about whether the
+        // devices in the config exist today.
+        return RunAutostart(options);
+    }
 
     const std::filesystem::path config_path =
         options.config_path.empty() ? DefaultConfigPath() : options.config_path;
@@ -458,7 +607,7 @@ int Run(int argc, wchar_t** argv) {
     log_settings.keep_files = loaded.config.log.keep_files;
     Logger::Init(log_settings);
     LogInfo(L"{} {} starting ({})", kAppName, kAppVersion,
-            options.check_config ? L"--check-config" : L"mixer");
+            options.check_config ? L"--check-config" : options.tray ? L"mixer, tray" : L"mixer");
 
     int exit_code = kExitOk;
     if (options.check_config) {
@@ -475,7 +624,7 @@ int Run(int argc, wchar_t** argv) {
         } else {
             LogInfo(L"config: {}", config_path.wstring());
             LogInfo(L"log   : {}", log_settings.file.wstring());
-            exit_code = RunEngine(loaded.config);
+            exit_code = RunEngine(loaded.config, options, config_path, log_settings.file);
         }
     }
 

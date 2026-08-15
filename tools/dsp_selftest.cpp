@@ -477,6 +477,112 @@ void TestGate() {
     Check(true, "gate: closes again after hold + release", 0.0);
 }
 
+// ---------------------------------------------------------------------------
+// 4. Live reconfiguration (stage 5).
+//
+// The tray's "reload config" hands the render thread a new set of coefficients
+// to adopt at a block boundary. Adopt() must replace the settings and leave the
+// running state alone - a limiter that is holding a peak down must keep holding
+// it, and a gate that is open on somebody's voice must stay open. Configure()
+// is the other half of the contract: it still resets, because it is what opens
+// a stream rather than what changes one.
+
+void TestLiveReconfigure() {
+    MixConfig mix;
+    mix.limiter_enabled = true;
+    mix.limiter_threshold_db = -1.0;
+    mix.limiter_release_ms = 80.0;
+
+    PeakLimiter limiter;
+    limiter.Configure(mix, kRate);
+
+    // Drive it into gain reduction and stop mid-peak.
+    const std::size_t block = 480;  // 10 ms, about one render callback
+    std::vector<float> l(block), r(block);
+    const auto fill_loud = [&](double amplitude) {
+        for (std::size_t i = 0; i < block; ++i) {
+            l[i] = static_cast<float>(amplitude * std::sin(2.0 * kPi * 220.0 * i / kRate));
+            r[i] = l[i];
+        }
+    };
+    fill_loud(1.6);
+    limiter.Process(l.data(), r.data(), block);
+
+    // A reload that changes only the release time. If Adopt reset the gain, the
+    // next block would start at unity and let the peak straight through.
+    MixConfig slower = mix;
+    slower.limiter_release_ms = 200.0;
+    limiter.Adopt(PeakLimiter::SettingsFrom(slower, kRate));
+
+    fill_loud(1.6);
+    limiter.Process(l.data(), r.data(), block);
+    float peak = 0.0f;
+    for (std::size_t i = 0; i < block; ++i) {
+        peak = (std::fabs)(l[i]) > peak ? (std::fabs)(l[i]) : peak;
+    }
+    Check(peak <= GainFromDb(-1.0) + 1e-6f, "reload: limiter keeps holding the peak down", peak);
+
+    // Turning the limiter off must actually let signal through again.
+    MixConfig off = mix;
+    off.limiter_enabled = false;
+    limiter.Adopt(PeakLimiter::SettingsFrom(off, kRate));
+    fill_loud(1.6);
+    limiter.Process(l.data(), r.data(), block);
+    peak = 0.0f;
+    for (std::size_t i = 0; i < block; ++i) {
+        peak = (std::fabs)(l[i]) > peak ? (std::fabs)(l[i]) : peak;
+    }
+    Check(peak > 1.5f, "reload: limiter switched off is out of the way", peak);
+
+    GateConfig gate_config;
+    gate_config.enabled = true;
+    gate_config.threshold_db = -45.0;
+    gate_config.attack_ms = 5.0;
+    gate_config.hold_ms = 120.0;
+    gate_config.release_ms = 150.0;
+
+    NoiseGate gate;
+    gate.Configure(gate_config, kRate);
+
+    // Open it on a -20 dBFS tone.
+    const std::size_t voice = kRate / 4;
+    std::vector<float> vl(voice), vr(voice);
+    for (std::size_t i = 0; i < voice; ++i) {
+        vl[i] = static_cast<float>(0.1 * std::sin(2.0 * kPi * 300.0 * i / kRate));
+        vr[i] = vl[i];
+    }
+    gate.Process(vl.data(), vr.data(), voice);
+
+    // Reload with a different release time, then keep talking. A Reset here
+    // would slam the gate shut and swallow the next syllable.
+    GateConfig faster = gate_config;
+    faster.release_ms = 60.0;
+    gate.Adopt(NoiseGate::SettingsFrom(faster, kRate));
+
+    for (std::size_t i = 0; i < block; ++i) {
+        vl[i] = static_cast<float>(0.1 * std::sin(2.0 * kPi * 300.0 * i / kRate));
+        vr[i] = vl[i];
+    }
+    gate.Process(vl.data(), vr.data(), block);
+    double lowest = 1.0;
+    for (std::size_t i = 0; i < block; ++i) {
+        const double level = (std::fabs)(vl[i]);
+        const double envelope = (std::fabs)(0.1 * std::sin(2.0 * kPi * 300.0 * i / kRate));
+        if (envelope > 0.05) {
+            lowest = (std::min)(lowest, level / envelope);
+        }
+    }
+    Check(lowest > 0.99, "reload: gate stays open across it", lowest);
+
+    // And Configure still resets, which is what a freshly opened stream needs.
+    NoiseGate fresh;
+    fresh.Configure(gate_config, kRate);
+    std::vector<float> ql(block, 0.0f), qr(block, 0.0f);
+    const DynamicsBlock quiet = fresh.Process(ql.data(), qr.data(), block);
+    Check(quiet.active_frames == block, "reload: Configure still resets a gate to closed",
+          static_cast<double>(quiet.active_frames));
+}
+
 }  // namespace
 
 int main() {
@@ -496,6 +602,9 @@ int main() {
     std::printf("\n--- dynamics ---\n");
     TestLimiter();
     TestGate();
+
+    std::printf("\n--- live reconfiguration ---\n");
+    TestLiveReconfigure();
 
     std::printf("\n%s (%d failures)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES", g_failures);
     return g_failures == 0 ? 0 : 1;

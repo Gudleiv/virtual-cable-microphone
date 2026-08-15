@@ -133,6 +133,19 @@ backoff_max_ms = 5000
 # silence, so nothing is audible and nothing about the device changes.
 keep_chat_clock_alive = false
 
+# How long to keep retrying at startup when a configured device is not there.
+#
+# This covers the opposite end from the rebuild backoff above. Once the streams
+# are up, a device that disappears is retried forever; but a device missing at
+# the moment vcmic starts used to be a hard error, and that is exactly what
+# happens on a machine that starts vcmic at logon - the USB stack is still
+# enumerating while we are already asking for the sound card.
+#
+# --install-autostart also puts a delay on the logon trigger itself, so the two
+# cover the same gap from either end. 0 restores the old behaviour of failing
+# immediately, which is what you want when running it by hand to check a config.
+startup_wait_s = 60
+
 [log]
 # trace|debug|info|warn|error|off
 level = "info"
