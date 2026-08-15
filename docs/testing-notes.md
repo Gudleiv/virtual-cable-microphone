@@ -203,7 +203,7 @@ rebuilding` and is serving again 8 ms later.
   recovery above was driven purely by the backoff timer. That is the design
   intent, and it is reassuring that it holds up alone, but the claim that a
   returning device is picked up in milliseconds rather than at the next retry is
-  unverified.
+  unverified. *(Closed on the machine — see the next section.)*
 - **The format-change rejection.** `winepulse` advertises 48000 Hz whatever the
   sink's real rate is, so a sink reloaded at 44100 Hz still presents as 48000
   and `SameFormat` accepts it. The branch has never run.
@@ -227,9 +227,84 @@ rebuilding` and is serving again 8 ms later.
    and come back. While it is down the render row must keep counting callbacks.
 3. **Leave it unplugged for a few minutes.** Retries should settle at 5 s and
    the log at roughly a line a minute. Replugging should be picked up at once —
-   this is the notification path the rig could not test.
+   the notification path, confirmed below for a device that returned within a
+   second but not yet for one that has been gone long enough to reach the
+   5 s ceiling.
 4. **Lower Max Latency in `VBCABLE_ControlPanel.exe` while vcmic runs.** Expect
    a rebuild and `cable render block is now N frames`.
 5. **`keep_chat_clock_alive = true`** (on in this machine's `config.toml`): with
    Discord silent the chat row should hold `fill ~40 ms` with `silent packets`
    climbing, instead of falling to `REFILLING`.
+
+## Stage 4: the first real outage, on the machine
+
+A 7.5-minute session on 2026-08-13, with a fifine USB microphone that left the
+bus twice on its own. It closes the largest of the gaps above and says something
+about that microphone worth writing down.
+
+### The notification path works
+
+The rig could not fire a single `IMMNotificationClient` callback, so every
+recovery measured there was the backoff timer alone. On the machine the
+callbacks arrive, and they arrive first:
+
+```
+21:16:16.166 [t=33788] device notification: the microphone endpoint is now NOTPRESENT
+21:16:16.180 [t=23040] mic stream lost: AUDCLNT_E_DEVICE_INVALIDATED (0x88890004) - rebuilding
+        ...
+21:16:16.947 [t=8944]  device notification: the microphone endpoint is now ACTIVE
+21:16:16.981 [t=23040] mic stream back after 0.8 s and 5 attempt(s)
+```
+
+The notification beat the stream's own error by 14 ms, and again by 15 ms on the
+second outage. Recovery followed the ACTIVE notification by 34 ms; by then the
+backoff had reached its fifth attempt and the next retry was 800 ms out, so this
+was the wake event cutting the wait short rather than the timer coming due.
+Callbacks also arrive on threads of their own, and not always the same one
+(t=33788, t=8944, t=26192, against the capture thread's t=23040) — which is the
+arrangement the wake-event design assumes, and the reason no recovery work is
+done inside them.
+
+Everything else matched the rig: the render never noticed either outage
+(`timeouts 0`, callbacks climbing straight through), the chat source never
+noticed (`underruns 0` for the whole session), and the microphone cost 1.4 ms of
+underrun for the first rebuild, 9.0 ms across all three.
+
+### A flapping device can rebuild without a visible line
+
+The session ended with `rebuilt 3x` on the mic row but only two `stream lost`
+lines at INFO. Both numbers are right. The third outage began 120 ms after the
+second recovery, so `StreamRetry` classified it as flapping and demoted both of
+its lines to DEBUG — the guard doing what it exists for, since a device flapping
+at that rate would otherwise fill the log faster than it fails. At
+`level = "debug"` all three are there. Worth knowing before hunting for a
+missing line: the counters are the authority, the WARN lines are a summary.
+
+### What the microphone was doing
+
+`discontinuities` counts `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, which the
+audio stack sets. It is a gap the driver is reporting, not one inferred here.
+Over the same 7.5 minutes:
+
+| source | discontinuities |
+|---|---|
+| chat (Sound Blaster GC7) | 1 |
+| mic (fifine) | 10 |
+
+The mic's climbed steadily between the outages as well as during them (3 → 5 →
+6 → 7 → 8 → 9 → 10), roughly one a minute, on a device that twice left the bus
+outright. The GC7 on the same host held at its single start-up gap. Windows had
+the microphone registered as `4- fifine Microphone`, and that numeric prefix is
+an instance counter — the device had been re-enumerating before this session.
+
+None of that is something vcmic can cause. `NOTPRESENT` means the device is gone
+from the system, which only the USB stack or the driver can do; every stream
+here is `AUDCLNT_SHAREMODE_SHARED`, and a shared-mode client can neither remove
+a device nor stop another process from opening the same one.
+
+One diagnostic that does **not** settle it either way: an empty System log in
+Event Viewer. Windows does not record USB arrival and removal there by default —
+the channels that would show it (`USB-USBHUB3-Analytic`,
+`DriverFrameworks-UserMode`) ship disabled — so finding nothing is the expected
+result whether or not the bus misbehaved. The decisive test is still a session
+with vcmic closed.
