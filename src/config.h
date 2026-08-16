@@ -100,12 +100,43 @@ struct ConfigLoad {
 // Missing file is not an error: defaults are returned with file_exists = false.
 ConfigLoad LoadConfigFile(const std::filesystem::path& path);
 
+// Writes every setting, with comments, creating the parent directory if it is
+// missing. This is what the tray calls after a change, so it has to produce a
+// file the reader accepts back verbatim - the round trip is covered by the
+// self-test.
+//
+// It rewrites the file whole. Values all survive, hand-written comments do not;
+// the generated ones are more complete than what they replace.
+bool SaveConfigFile(const std::filesystem::path& path, const Config& config, std::wstring& error);
+
 // Checks the fields the audio engine cannot start without.
 void ValidateForEngine(const Config& config, std::vector<std::wstring>& errors);
 
+// Where the settings file is, and how we came to think so.
+struct ConfigLocation {
+    std::filesystem::path path;
+    bool exists = false;
+    bool from_command_line = false;
+    bool portable = false;  // found next to the executable rather than in AppData
+};
+
+// Search order: `override_path` if the command line gave one, then
+// %APPDATA%\vcmic\config.toml, then config.toml next to the executable. When
+// none of them exists the AppData path is still returned, because that is
+// where a first run will write one.
+//
+// The executable's own directory comes last on purpose. It used to be the only
+// candidate, which put the settings inside a build output folder - fine while
+// somebody is typing the command, useless the moment a scheduled task starts
+// with a working directory of its own.
+ConfigLocation ResolveConfigPath(const std::filesystem::path& override_path);
+
 std::filesystem::path DefaultConfigPath();
 
-// Resolves a possibly relative path from the config against the executable dir.
-std::filesystem::path ResolveRelativeToExe(const std::wstring& path);
+// Resolves a possibly relative path from the config - the log file - against
+// the directory the config itself came from, so that settings and log stay
+// together wherever that turns out to be.
+std::filesystem::path ResolveRelativeTo(const std::filesystem::path& directory,
+                                        const std::wstring& path);
 
 }  // namespace vcmic

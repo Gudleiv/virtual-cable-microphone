@@ -70,4 +70,31 @@ HRESULT ResolveDevice(IMMDeviceEnumerator* enumerator, EDataFlow flow,
                       const DeviceSelector& selector, bool probe_format, ResolvedDevice& out,
                       std::wstring& error);
 
+// Records both the id, which is what actually selects the device, and the
+// friendly name, which is what finds it again after a driver reinstall changes
+// the id out from under us.
+DeviceSelector SelectorFor(const EndpointInfo& info);
+
+// Which of the three roles a guess managed to fill.
+struct DeviceSuggestion {
+    DevicesConfig devices;
+    bool chat = false;
+    bool mic = false;
+    bool output = false;
+
+    bool complete() const { return chat && mic && output; }
+};
+
+// A first guess at the three endpoints, for a machine with no config yet: the
+// default communications devices for chat and microphone, and whatever calls
+// itself a VB-CABLE for the output. It is a guess and is logged as one - the
+// chat endpoint in particular is only correct if Discord happens to be playing
+// into the default.
+DeviceSuggestion SuggestDevices(const std::vector<EndpointInfo>& render,
+                                const std::vector<EndpointInfo>& capture);
+
+// Enumerates both directions and guesses in one call, for callers that have an
+// enumerator and no endpoint lists of their own.
+HRESULT SuggestDevices(IMMDeviceEnumerator* enumerator, DeviceSuggestion& out);
+
 }  // namespace vcmic

@@ -316,4 +316,85 @@ HRESULT ResolveDevice(IMMDeviceEnumerator* enumerator, EDataFlow flow,
     return S_OK;
 }
 
+DeviceSelector SelectorFor(const EndpointInfo& info) {
+    DeviceSelector selector;
+    selector.id = info.id;
+    selector.name_contains = info.friendly_name;
+    return selector;
+}
+
+DeviceSuggestion SuggestDevices(const std::vector<EndpointInfo>& render,
+                                const std::vector<EndpointInfo>& capture) {
+    const auto by_name = [](const std::vector<EndpointInfo>& list,
+                            std::wstring_view fragment) -> const EndpointInfo* {
+        for (const EndpointInfo& info : list) {
+            if (info.IsActive() && ContainsNoCase(info.friendly_name, fragment)) {
+                return &info;
+            }
+        }
+        return nullptr;
+    };
+    const auto communications = [](const std::vector<EndpointInfo>& list) -> const EndpointInfo* {
+        for (const EndpointInfo& info : list) {
+            if (info.IsActive() && info.default_communications) {
+                return &info;
+            }
+        }
+        return nullptr;
+    };
+
+    // The cable first, and by name: it is the one endpoint whose identity is
+    // not a matter of taste, and it must not be picked as anything else.
+    const EndpointInfo* cable = by_name(render, L"cable-a input");
+    if (cable == nullptr) {
+        cable = by_name(render, L"cable input");
+    }
+
+    // Where the voices come from. Discord follows the communications default
+    // unless it has been told otherwise, which is exactly the case this guess
+    // is for; a headset is the fallback.
+    const EndpointInfo* chat = communications(render);
+    if (chat == cable) {
+        chat = nullptr;  // rendering into the cable and recording it would be a loop
+    }
+    if (chat == nullptr) {
+        chat = by_name(render, L"headset");
+    }
+
+    const EndpointInfo* mic = communications(capture);
+    if (mic == nullptr) {
+        mic = by_name(capture, L"microphone");
+    }
+
+    DeviceSuggestion suggestion;
+    if (chat != nullptr) {
+        suggestion.devices.chat_render = SelectorFor(*chat);
+        suggestion.chat = true;
+    }
+    if (mic != nullptr) {
+        suggestion.devices.mic_capture = SelectorFor(*mic);
+        suggestion.mic = true;
+    }
+    if (cable != nullptr) {
+        suggestion.devices.output_render = SelectorFor(*cable);
+        suggestion.output = true;
+    }
+    return suggestion;
+}
+
+HRESULT SuggestDevices(IMMDeviceEnumerator* enumerator, DeviceSuggestion& out) {
+    std::vector<EndpointInfo> render;
+    std::vector<EndpointInfo> capture;
+    HRESULT hr = CollectEndpoints(enumerator, eRender, DEVICE_STATE_ACTIVE, false, render);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    hr = CollectEndpoints(enumerator, eCapture, DEVICE_STATE_ACTIVE, false, capture);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    out = SuggestDevices(render, capture);
+    return S_OK;
+}
+
 }  // namespace vcmic

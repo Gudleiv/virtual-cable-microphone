@@ -16,15 +16,25 @@
 #include <random>
 #include <vector>
 
+#ifdef _WIN32
+#include "win_headers.h"
+
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
+#endif
+
 using namespace vcmic;
 
 namespace {
 
 int g_failures = 0;
 
-void Check(bool ok, const char* what, double value = 0.0) {
+bool Check(bool ok, const char* what, double value = 0.0) {
     std::printf("%-58s %-6s %g\n", what, ok ? "ok" : "FAIL", value);
     if (!ok) ++g_failures;
+    return ok;
 }
 
 constexpr double kPi = 3.14159265358979323846;
@@ -585,6 +595,165 @@ void TestLiveReconfigure() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Config round trip
+//
+// The tray writes this file now, so the writer and the reader have to agree
+// exactly. A key the writer spells differently would not fail loudly: it would
+// come back as "unknown key (ignored)" and that setting would quietly revert to
+// its default the next time vcmic started.
+//
+// Needs the filesystem and the Windows-only helpers config.cpp links against,
+// so it runs in the mingw build under Wine rather than in the host ASan one.
+#ifdef _WIN32
+
+namespace {
+
+std::filesystem::path TempConfigPath() {
+    wchar_t buffer[MAX_PATH] = {};
+    const DWORD length = ::GetTempPathW(MAX_PATH, buffer);
+    std::filesystem::path directory =
+        length == 0 ? std::filesystem::path(L".") : std::filesystem::path(buffer);
+    return directory / L"vcmic-selftest-config.toml";
+}
+
+// Deliberately none of the defaults, so a field the writer forgets shows up as
+// a mismatch rather than passing by accident.
+Config SampleConfig() {
+    Config c;
+    c.devices.chat_render.id = L"{0.0.0.00000000}.{d08ae5da-995b-4f0e-8adb-ac19ddc87bf0}";
+    // An ampersand and a quote, because friendly names really do contain them.
+    c.devices.chat_render.name_contains = L"Headset \"A&B\" (GC7)";
+    c.devices.mic_capture.id = L"{0.0.1.00000000}.{07e3bc09-e84c-412f-a7bd-290bca23d211}";
+    c.devices.mic_capture.name_contains = L"Микрофон (fifine)";
+    c.devices.output_render.id = L"{0.0.0.00000000}.{4367dfca-8893-49ed-80fd-c740a21c9cb9}";
+    c.devices.output_render.name_contains = L"CABLE-A Input";
+
+    c.audio.sample_rate = 44100;
+    c.audio.require_sample_rate = false;
+    c.audio.target_buffer_ms = 37.5;
+    c.audio.ring_capacity_ms = 260.0;
+
+    c.mix.chat_gain_db = -3.5;
+    c.mix.mic_gain_db = 2.25;
+    c.mix.gain_smoothing_ms = 12.5;
+    c.mix.limiter_enabled = false;
+    c.mix.limiter_threshold_db = -2.5;
+    c.mix.limiter_release_ms = 95.0;
+
+    c.gate.enabled = true;
+    c.gate.threshold_db = -47.5;
+    c.gate.attack_ms = 6.5;
+    c.gate.hold_ms = 130.0;
+    c.gate.release_ms = 155.0;
+
+    c.drift.enabled = false;
+    c.drift.measure_window_s = 1.5;
+    c.drift.response_s = 25.0;
+    c.drift.max_rate_correction = 0.0008;
+
+    c.resilience.backoff_min_ms = 150;
+    c.resilience.backoff_max_ms = 6000;
+    c.resilience.keep_chat_clock_alive = true;
+    c.resilience.startup_wait_s = 90;
+
+    c.log.level = LogLevel::Debug;
+    // Backslashes and a 't': unescaped, TOML would hand back a tab.
+    c.log.file = L"C:\\temp\\vcmic.log";
+    c.log.max_bytes = 3u * 1024u * 1024u;
+    c.log.keep_files = 5;
+    c.log.console = false;
+    c.log.stats_interval_s = 45;
+    return c;
+}
+
+}  // namespace
+
+void TestConfigRoundTrip() {
+    const std::filesystem::path path = TempConfigPath();
+    const Config original = SampleConfig();
+
+    std::wstring error;
+    if (!Check(SaveConfigFile(path, original, error), "config: saved")) {
+        std::wprintf(L"    %ls\n", error.c_str());
+        return;
+    }
+
+    ConfigLoad loaded = LoadConfigFile(path);
+    Check(loaded.file_exists, "config: reads back");
+    Check(loaded.ok, "config: parses without errors");
+    for (const std::wstring& message : loaded.errors) {
+        std::wprintf(L"    error: %ls\n", message.c_str());
+    }
+    // The one that catches a key the two sides spell differently.
+    Check(loaded.warnings.empty(), "config: every key written is a key the reader knows");
+    for (const std::wstring& message : loaded.warnings) {
+        std::wprintf(L"    warning: %ls\n", message.c_str());
+    }
+
+    const Config& r = loaded.config;
+    Check(r.devices.chat_render.id == original.devices.chat_render.id &&
+              r.devices.chat_render.name_contains == original.devices.chat_render.name_contains &&
+              r.devices.mic_capture.id == original.devices.mic_capture.id &&
+              r.devices.mic_capture.name_contains == original.devices.mic_capture.name_contains &&
+              r.devices.output_render.id == original.devices.output_render.id &&
+              r.devices.output_render.name_contains == original.devices.output_render.name_contains,
+          "config: [devices] survives, quotes and ampersands included");
+    Check(r.audio.sample_rate == original.audio.sample_rate &&
+              r.audio.require_sample_rate == original.audio.require_sample_rate &&
+              r.audio.target_buffer_ms == original.audio.target_buffer_ms &&
+              r.audio.ring_capacity_ms == original.audio.ring_capacity_ms,
+          "config: [audio] survives");
+    Check(r.mix.chat_gain_db == original.mix.chat_gain_db &&
+              r.mix.mic_gain_db == original.mix.mic_gain_db &&
+              r.mix.gain_smoothing_ms == original.mix.gain_smoothing_ms &&
+              r.mix.limiter_enabled == original.mix.limiter_enabled &&
+              r.mix.limiter_threshold_db == original.mix.limiter_threshold_db &&
+              r.mix.limiter_release_ms == original.mix.limiter_release_ms,
+          "config: [mix] survives");
+    Check(r.gate.enabled == original.gate.enabled &&
+              r.gate.threshold_db == original.gate.threshold_db &&
+              r.gate.attack_ms == original.gate.attack_ms &&
+              r.gate.hold_ms == original.gate.hold_ms &&
+              r.gate.release_ms == original.gate.release_ms,
+          "config: [gate] survives");
+    Check(r.drift.enabled == original.drift.enabled &&
+              r.drift.measure_window_s == original.drift.measure_window_s &&
+              r.drift.response_s == original.drift.response_s &&
+              r.drift.max_rate_correction == original.drift.max_rate_correction,
+          "config: [drift] survives");
+    Check(r.resilience.backoff_min_ms == original.resilience.backoff_min_ms &&
+              r.resilience.backoff_max_ms == original.resilience.backoff_max_ms &&
+              r.resilience.keep_chat_clock_alive == original.resilience.keep_chat_clock_alive &&
+              r.resilience.startup_wait_s == original.resilience.startup_wait_s,
+          "config: [resilience] survives");
+    Check(r.log.level == original.log.level && r.log.file == original.log.file &&
+              r.log.max_bytes == original.log.max_bytes &&
+              r.log.keep_files == original.log.keep_files &&
+              r.log.console == original.log.console &&
+              r.log.stats_interval_s == original.log.stats_interval_s,
+          "config: [log] survives, backslashes included");
+
+    // Saving what was just loaded has to produce the same bytes, or the tray
+    // would rewrite the file on every start.
+    const std::filesystem::path second = TempConfigPath().replace_extension(L".2.toml");
+    if (SaveConfigFile(second, loaded.config, error)) {
+        std::ifstream a(path, std::ios::binary);
+        std::ifstream b(second, std::ios::binary);
+        const std::string text_a((std::istreambuf_iterator<char>(a)),
+                                 std::istreambuf_iterator<char>());
+        const std::string text_b((std::istreambuf_iterator<char>(b)),
+                                 std::istreambuf_iterator<char>());
+        Check(text_a == text_b && !text_a.empty(), "config: writing it again is byte-identical");
+    }
+
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    std::filesystem::remove(second, ignored);
+}
+
+#endif  // _WIN32
+
 int main() {
     std::printf("--- resampler ---\n");
     TestResampler(1.0, 1000.0, "ratio 1.000000");
@@ -605,6 +774,13 @@ int main() {
 
     std::printf("\n--- live reconfiguration ---\n");
     TestLiveReconfigure();
+
+#ifdef _WIN32
+    std::printf("\n--- config round trip ---\n");
+    TestConfigRoundTrip();
+#else
+    std::printf("\n--- config round trip ---\nskipped: needs the Windows build\n");
+#endif
 
     std::printf("\n%s (%d failures)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES", g_failures);
     return g_failures == 0 ? 0 : 1;

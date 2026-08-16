@@ -27,13 +27,45 @@ enum MenuId : UINT {
     kIdOpenLog,
     kIdOpenConfig,
     kIdExit,
+    kIdLimiter,
+    kIdGate,
+    kIdDrift,
+    kIdChatGainDown,
+    kIdChatGainUp,
+    kIdMicGainDown,
+    kIdMicGainUp,
 };
+
+// Ranges for the entries that exist only while a menu is open. Their index
+// within the range is the index into the list the menu was built from, which is
+// why ShowMenu holds that list until the command has been dispatched.
+constexpr UINT kDeviceSpan = 64;  // well past the number of endpoints any machine has
+constexpr UINT kLadderSpan = 32;
+constexpr UINT kIdChatDeviceBase = 0x1000;
+constexpr UINT kIdMicDeviceBase = kIdChatDeviceBase + kDeviceSpan;
+constexpr UINT kIdOutDeviceBase = kIdMicDeviceBase + kDeviceSpan;
+constexpr UINT kIdChatGainBase = kIdOutDeviceBase + kDeviceSpan;
+constexpr UINT kIdMicGainBase = kIdChatGainBase + kLadderSpan;
+constexpr UINT kIdGateBase = kIdMicGainBase + kLadderSpan;
+
+// Fine near unity, coarse where nobody balances by the decibel.
+constexpr double kGainLadder[] = {-24.0, -18.0, -12.0, -9.0, -6.0, -4.0, -3.0, -2.0, -1.0,
+                                  0.0,   1.0,   2.0,   3.0,  4.0,  6.0,  9.0,  12.0};
+constexpr double kGateLadder[] = {-70.0, -60.0, -55.0, -50.0, -45.0,
+                                  -40.0, -35.0, -30.0, -25.0, -20.0};
+
+// What config.cpp accepts back, so a nudge can never write a value the reader
+// would then refuse.
+constexpr double kGainMinDb = -60.0;
+constexpr double kGainMaxDb = 24.0;
+constexpr double kGainStepDb = 1.0;
 
 COLORREF StateColour(TrayState state) {
     switch (state) {
         case TrayState::Running:
             return RGB(76, 189, 106);
         case TrayState::Degraded:
+        case TrayState::Setup:
             return RGB(233, 168, 48);
         case TrayState::Failed:
             return RGB(214, 73, 62);
@@ -49,6 +81,8 @@ const wchar_t* StateWord(TrayState state) {
             return L"running";
         case TrayState::Degraded:
             return L"degraded";
+        case TrayState::Setup:
+            return L"not set up";
         case TrayState::Failed:
             return L"stopped";
         case TrayState::Starting:
@@ -180,6 +214,96 @@ void CopyTruncated(wchar_t* destination, std::size_t capacity, std::wstring_view
     const std::size_t copied = (std::min)(text.size(), capacity - 1);
     std::memcpy(destination, text.data(), copied * sizeof(wchar_t));
     destination[copied] = L'\0';
+}
+
+// A menu label is not a plain string: a lone '&' underlines the next character
+// and disappears. Device names really do contain them.
+std::wstring EscapeLabel(std::wstring_view text) {
+    std::wstring out;
+    out.reserve(text.size());
+    for (const wchar_t c : text) {
+        out.push_back(c);
+        if (c == L'&') {
+            out.push_back(L'&');
+        }
+    }
+    return out;
+}
+
+std::wstring GainLabel(double db) { return std::format(L"{:+.1f} dB", db); }
+std::wstring GateLabel(double db) { return std::format(L"{:.0f} dB", db); }
+
+// Marks the item whose value equals `current` as the selected one of the group,
+// which is what turns the tick into a radio bullet.
+void MarkRadio(HMENU menu, UINT base, std::size_t count, std::size_t selected) {
+    if (selected >= count) {
+        return;
+    }
+    ::CheckMenuRadioItem(menu, base, base + static_cast<UINT>(count) - 1,
+                         base + static_cast<UINT>(selected), MF_BYCOMMAND);
+}
+
+HMENU BuildDeviceMenu(const std::vector<DeviceChoice>& choices, UINT base) {
+    const HMENU menu = ::CreatePopupMenu();
+    if (menu == nullptr) {
+        return nullptr;
+    }
+    if (choices.empty()) {
+        ::AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"no endpoints found");
+        return menu;
+    }
+
+    const std::size_t count = (std::min)(choices.size(), static_cast<std::size_t>(kDeviceSpan));
+    std::size_t selected = count;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::wstring label = EscapeLabel(choices[i].name);
+        if (!choices[i].present) {
+            // Configured, but not plugged in. Shown rather than dropped, so the
+            // menu answers "what is it set to" even when the answer is absent.
+            label += L"   (not connected)";
+        }
+        ::AppendMenuW(menu, MF_STRING, base + static_cast<UINT>(i), label.c_str());
+        if (choices[i].current) {
+            selected = i;
+        }
+    }
+    MarkRadio(menu, base, count, selected);
+    if (choices.size() > count) {
+        // Should never happen on a real machine, but a menu that quietly showed
+        // 64 of 70 endpoints would look like the missing ones do not exist.
+        ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        ::AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
+                      std::format(L"{} more not shown - use the config file",
+                                  choices.size() - count)
+                          .c_str());
+    }
+    return menu;
+}
+
+HMENU BuildLadder(const double* values, std::size_t count, UINT base, double current,
+                  std::wstring (*label)(double)) {
+    const HMENU menu = ::CreatePopupMenu();
+    if (menu == nullptr) {
+        return nullptr;
+    }
+    std::size_t selected = count;
+    for (std::size_t i = 0; i < count; ++i) {
+        ::AppendMenuW(menu, MF_STRING, base + static_cast<UINT>(i), label(values[i]).c_str());
+        // Exact match only. A value nudged off the ladder leaves every stop
+        // unmarked, and the submenu's own title carries the real number.
+        if (std::fabs(values[i] - current) < 0.001) {
+            selected = i;
+        }
+    }
+    MarkRadio(menu, base, count, selected);
+    return menu;
+}
+
+UINT CheckedIf(bool condition) { return condition ? MF_CHECKED : MF_UNCHECKED; }
+UINT EnabledIf(bool condition) { return condition ? MF_ENABLED : (MF_DISABLED | MF_GRAYED); }
+
+double NudgeGain(double current, double delta) {
+    return (std::max)(kGainMinDb, (std::min)(kGainMaxDb, current + delta));
 }
 
 // Hands a path to whatever is registered for it, and falls back to showing it
@@ -346,24 +470,85 @@ void TrayIcon::ShowMenu() {
         return;
     }
 
+    // One enumeration for all three submenus, done here rather than lazily on
+    // WM_INITMENUPOPUP: reading the endpoint list without probing formats costs
+    // a few milliseconds, and the menu is simpler for owning it outright.
+    const DeviceMenus devices = host_->Devices();
+    const TraySettings settings = host_->Settings();
+    const bool mixing = host_->Mixing();
+
     const std::wstring header = std::format(L"{} {} - {}", kAppName, kAppVersion, StateWord(state_));
     ::AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, header.c_str());
     if (!detail_.empty()) {
-        ::AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, detail_.c_str());
+        ::AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
+                      EscapeLabel(detail_).c_str());
     }
+
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    ::AppendMenuW(menu, MF_STRING | (host_->ChatMuted() ? MF_CHECKED : MF_UNCHECKED), kIdMuteChat,
+    ::AppendMenuW(menu, MF_STRING | CheckedIf(host_->ChatMuted()) | EnabledIf(mixing), kIdMuteChat,
                   L"Mute &chat");
-    ::AppendMenuW(menu, MF_STRING | (host_->MicMuted() ? MF_CHECKED : MF_UNCHECKED), kIdMuteMic,
+    ::AppendMenuW(menu, MF_STRING | CheckedIf(host_->MicMuted()) | EnabledIf(mixing), kIdMuteMic,
                   L"Mute &microphone");
+
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    ::AppendMenuW(menu, MF_STRING, kIdReload, L"&Reload config");
-    ::AppendMenuW(menu, MF_STRING, kIdStatus, L"Write &status to log");
+    if (const HMENU sub = BuildDeviceMenu(devices.chat, kIdChatDeviceBase)) {
+        ::AppendMenuW(menu, MF_POPUP | MF_STRING, reinterpret_cast<UINT_PTR>(sub),
+                      L"C&hat source (what Discord plays into)");
+    }
+    if (const HMENU sub = BuildDeviceMenu(devices.microphone, kIdMicDeviceBase)) {
+        ::AppendMenuW(menu, MF_POPUP | MF_STRING, reinterpret_cast<UINT_PTR>(sub), L"M&icrophone");
+    }
+    if (const HMENU sub = BuildDeviceMenu(devices.output, kIdOutDeviceBase)) {
+        ::AppendMenuW(menu, MF_POPUP | MF_STRING, reinterpret_cast<UINT_PTR>(sub),
+                      L"&Output (the cable ShadowPlay records)");
+    }
+
+    ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    if (const HMENU sub = BuildLadder(kGainLadder, std::size(kGainLadder), kIdChatGainBase,
+                                      settings.chat_gain_db, &GainLabel)) {
+        ::AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        ::AppendMenuW(sub, MF_STRING, kIdChatGainDown, L"Quieter by 1 dB");
+        ::AppendMenuW(sub, MF_STRING, kIdChatGainUp, L"Louder by 1 dB");
+        ::AppendMenuW(menu, MF_POPUP | MF_STRING, reinterpret_cast<UINT_PTR>(sub),
+                      std::format(L"Chat &volume  ({})", GainLabel(settings.chat_gain_db)).c_str());
+    }
+    if (const HMENU sub = BuildLadder(kGainLadder, std::size(kGainLadder), kIdMicGainBase,
+                                      settings.mic_gain_db, &GainLabel)) {
+        ::AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        ::AppendMenuW(sub, MF_STRING, kIdMicGainDown, L"Quieter by 1 dB");
+        ::AppendMenuW(sub, MF_STRING, kIdMicGainUp, L"Louder by 1 dB");
+        ::AppendMenuW(menu, MF_POPUP | MF_STRING, reinterpret_cast<UINT_PTR>(sub),
+                      std::format(L"Microphone vo&lume  ({})", GainLabel(settings.mic_gain_db))
+                          .c_str());
+    }
+    if (const HMENU sub = ::CreatePopupMenu()) {
+        ::AppendMenuW(sub, MF_STRING | CheckedIf(settings.limiter), kIdLimiter,
+                      L"&Limiter (stops the mix clipping)");
+        ::AppendMenuW(sub, MF_STRING | CheckedIf(settings.gate), kIdGate,
+                      L"Noise &gate on the microphone");
+        if (const HMENU threshold =
+                BuildLadder(kGateLadder, std::size(kGateLadder), kIdGateBase,
+                            settings.gate_threshold_db, &GateLabel)) {
+            ::AppendMenuW(sub, MF_POPUP | MF_STRING | EnabledIf(settings.gate),
+                          reinterpret_cast<UINT_PTR>(threshold),
+                          std::format(L"Gate &threshold  ({})",
+                                      GateLabel(settings.gate_threshold_db))
+                              .c_str());
+        }
+        ::AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        ::AppendMenuW(sub, MF_STRING | CheckedIf(settings.drift), kIdDrift,
+                      L"&Drift compensation");
+        ::AppendMenuW(menu, MF_POPUP | MF_STRING, reinterpret_cast<UINT_PTR>(sub), L"&Processing");
+    }
+
+    ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    ::AppendMenuW(menu, MF_STRING, kIdReload, L"&Reload settings from the file");
+    ::AppendMenuW(menu, MF_STRING | EnabledIf(mixing), kIdStatus, L"Write &status to log");
     if (!log_file_.empty()) {
-        ::AppendMenuW(menu, MF_STRING, kIdOpenLog, L"Open &log");
+        ::AppendMenuW(menu, MF_STRING, kIdOpenLog, L"Open lo&g");
     }
     if (!config_file_.empty()) {
-        ::AppendMenuW(menu, MF_STRING, kIdOpenConfig, L"Open co&nfig");
+        ::AppendMenuW(menu, MF_STRING, kIdOpenConfig, L"Open co&nfig file");
     }
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING, kIdExit, L"E&xit");
@@ -378,17 +563,79 @@ void TrayIcon::ShowMenu() {
     const int command =
         ::TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, cursor.x, cursor.y,
                          0, hwnd_, nullptr);
+    // Takes the attached submenus with it.
     ::DestroyMenu(menu);
     ::PostMessageW(hwnd_, WM_NULL, 0, 0);
 
     // The menu runs a modal loop of its own, so nothing else on this thread
     // moves while it is open. The audio threads are elsewhere and do not care.
-    switch (command) {
+    Dispatch(command, devices, settings);
+}
+
+void TrayIcon::Dispatch(int command, const DeviceMenus& devices, const TraySettings& settings) {
+    if (command <= 0 || host_ == nullptr) {
+        return;
+    }
+    const UINT id = static_cast<UINT>(command);
+
+    const auto device = [this](const std::vector<DeviceChoice>& list, UINT index, DeviceRole role) {
+        if (index < list.size()) {
+            host_->OnSelectDevice(role, list[index].id, list[index].name);
+        }
+    };
+    if (id >= kIdChatDeviceBase && id < kIdChatDeviceBase + kDeviceSpan) {
+        device(devices.chat, id - kIdChatDeviceBase, DeviceRole::Chat);
+        return;
+    }
+    if (id >= kIdMicDeviceBase && id < kIdMicDeviceBase + kDeviceSpan) {
+        device(devices.microphone, id - kIdMicDeviceBase, DeviceRole::Microphone);
+        return;
+    }
+    if (id >= kIdOutDeviceBase && id < kIdOutDeviceBase + kDeviceSpan) {
+        device(devices.output, id - kIdOutDeviceBase, DeviceRole::Output);
+        return;
+    }
+
+    if (id >= kIdChatGainBase && id < kIdChatGainBase + std::size(kGainLadder)) {
+        host_->OnSetGain(DeviceRole::Chat, kGainLadder[id - kIdChatGainBase]);
+        return;
+    }
+    if (id >= kIdMicGainBase && id < kIdMicGainBase + std::size(kGainLadder)) {
+        host_->OnSetGain(DeviceRole::Microphone, kGainLadder[id - kIdMicGainBase]);
+        return;
+    }
+    if (id >= kIdGateBase && id < kIdGateBase + std::size(kGateLadder)) {
+        host_->OnSetGateThreshold(kGateLadder[id - kIdGateBase]);
+        return;
+    }
+
+    switch (id) {
         case kIdMuteChat:
             host_->OnToggleChatMute();
             break;
         case kIdMuteMic:
             host_->OnToggleMicMute();
+            break;
+        case kIdChatGainDown:
+            host_->OnSetGain(DeviceRole::Chat, NudgeGain(settings.chat_gain_db, -kGainStepDb));
+            break;
+        case kIdChatGainUp:
+            host_->OnSetGain(DeviceRole::Chat, NudgeGain(settings.chat_gain_db, kGainStepDb));
+            break;
+        case kIdMicGainDown:
+            host_->OnSetGain(DeviceRole::Microphone, NudgeGain(settings.mic_gain_db, -kGainStepDb));
+            break;
+        case kIdMicGainUp:
+            host_->OnSetGain(DeviceRole::Microphone, NudgeGain(settings.mic_gain_db, kGainStepDb));
+            break;
+        case kIdLimiter:
+            host_->OnToggleLimiter();
+            break;
+        case kIdGate:
+            host_->OnToggleGate();
+            break;
+        case kIdDrift:
+            host_->OnToggleDrift();
             break;
         case kIdReload:
             host_->OnReloadConfig();

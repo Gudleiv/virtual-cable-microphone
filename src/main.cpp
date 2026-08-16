@@ -55,12 +55,13 @@ void PrintUsage() {
     PrintLine();
     PrintLine(L"With no mode option, vcmic runs the mixer until Ctrl+C.");
     PrintLine();
+    PrintLine(L"  -t, --tray             run with an icon in the notification area, and set the");
+    PrintLine(L"                         devices, volumes and processing from its menu");
     PrintLine(L"  -l, --list-devices     list every audio endpoint with id, roles and mix format");
     PrintLine(L"      --active-only      with --list-devices: hide disabled/unplugged endpoints");
     PrintLine(L"      --check-config     resolve the configured devices and validate their formats");
-    PrintLine(L"  -c, --config <path>    config file (default: config.toml next to the exe)");
+    PrintLine(L"  -c, --config <path>    settings file to use instead of the one found below");
     PrintLine(L"      --log-level <lvl>  trace|debug|info|warn|error|off, overrides the config");
-    PrintLine(L"  -t, --tray             run with an icon in the notification area");
     PrintLine(L"  -v, --version          print the version and exit");
     PrintLine(L"  -h, --help             print this help and exit");
     PrintLine();
@@ -72,7 +73,13 @@ void PrintUsage() {
     PrintLine(L"      --uninstall-autostart  remove that job");
     PrintLine(L"      --autostart-status     print what is currently registered");
     PrintLine();
-    PrintLine(L"Fill config.toml from the ids printed by --list-devices, then run --check-config.");
+    PrintLine(L"Settings are looked for in this order, and the log goes next to whichever wins:");
+    PrintLine(L"  1. the path given to --config");
+    PrintLine(L"  2. {}", DefaultConfigPath().wstring());
+    PrintLine(L"  3. config.toml next to vcmic.exe");
+    PrintLine();
+    PrintLine(L"None of them has to exist. 'vcmic --tray' on a machine with no settings picks the");
+    PrintLine(L"devices itself, writes them to (2), and lets you correct it from the menu.");
 }
 
 bool ParseArguments(int argc, wchar_t** argv, Options& options, std::wstring& error) {
@@ -183,60 +190,34 @@ void PrintEndpoint(std::size_t index, const EndpointInfo& info) {
     PrintLine();
 }
 
-const EndpointInfo* FindByName(const std::vector<EndpointInfo>& endpoints,
-                               std::wstring_view fragment) {
-    for (const EndpointInfo& info : endpoints) {
-        if (info.IsActive() && ContainsNoCase(info.friendly_name, fragment)) {
-            return &info;
-        }
-    }
-    return nullptr;
-}
-
-const EndpointInfo* FindDefaultCommunications(const std::vector<EndpointInfo>& endpoints) {
-    for (const EndpointInfo& info : endpoints) {
-        if (info.IsActive() && info.default_communications) {
-            return &info;
-        }
-    }
-    return nullptr;
-}
-
-void PrintConfigLine(const wchar_t* key, const EndpointInfo* info) {
-    if (info == nullptr) {
+void PrintConfigLine(const wchar_t* key, const DeviceSelector& selector, bool found) {
+    if (!found) {
         PrintLine(L"{} = \"\"   # not detected - fill this in by hand", key);
         return;
     }
-    PrintLine(L"{} = \"{}\"   # {}", key, info->id, info->friendly_name);
+    PrintLine(L"{} = \"{}\"   # {}", key, selector.id, selector.name_contains);
 }
 
-// A guess, printed only to save typing. The user still has to confirm that the
-// chat endpoint really is the one Discord plays into.
+// A guess, printed only to save typing - the same one the tray makes on a first
+// run. The user still has to confirm that the chat endpoint really is the one
+// Discord plays into.
 void PrintSuggestedConfig(const std::vector<EndpointInfo>& render,
                           const std::vector<EndpointInfo>& capture) {
-    const EndpointInfo* cable_in = FindByName(render, L"cable-a input");
-    if (cable_in == nullptr) {
-        cable_in = FindByName(render, L"cable input");
-    }
-    const EndpointInfo* chat = FindDefaultCommunications(render);
-    if (chat == nullptr) {
-        chat = FindByName(render, L"headset");
-    }
-    const EndpointInfo* mic = FindDefaultCommunications(capture);
-    if (mic == nullptr) {
-        mic = FindByName(capture, L"microphone");
-    }
+    const DeviceSuggestion suggestion = SuggestDevices(render, capture);
 
     PrintLine(L"=== Suggested [devices] block (verify before trusting it) ===");
     PrintLine();
     PrintLine(L"[devices]");
-    PrintConfigLine(L"chat_render_id  ", chat);
-    PrintConfigLine(L"mic_capture_id  ", mic);
-    PrintConfigLine(L"output_render_id", cable_in);
+    PrintConfigLine(L"chat_render_id  ", suggestion.devices.chat_render, suggestion.chat);
+    PrintConfigLine(L"mic_capture_id  ", suggestion.devices.mic_capture, suggestion.mic);
+    PrintConfigLine(L"output_render_id", suggestion.devices.output_render, suggestion.output);
     PrintLine();
     PrintLine(L"chat_render_id must be the endpoint Discord plays into (the GC7 chat side),");
     PrintLine(L"output_render_id must be the CABLE-A *Input* (render) endpoint.");
     PrintLine(L"In ShadowPlay pick the matching CABLE-A *Output* (capture) endpoint as microphone.");
+    PrintLine();
+    PrintLine(L"Or skip all of this: 'vcmic --tray' picks the devices itself on a first run and");
+    PrintLine(L"lets you change them from the notification area.");
     PrintLine();
 }
 
@@ -291,10 +272,9 @@ struct EngineDevice {
     const DeviceSelector* selector;
 };
 
-int RunCheckConfig(const Config& config, const std::filesystem::path& config_path,
-                   bool config_exists) {
-    PrintLine(L"config file : {}{}", config_path.wstring(),
-              config_exists ? L"" : L"   (missing - defaults in use)");
+int RunCheckConfig(const Config& config, const ConfigLocation& location) {
+    PrintLine(L"config file : {}{}", location.path.wstring(),
+              location.exists ? L"" : L"   (does not exist yet - defaults in use)");
     PrintLine();
 
     std::vector<std::wstring> errors;
@@ -303,6 +283,7 @@ int RunCheckConfig(const Config& config, const std::filesystem::path& config_pat
         PrintErrLine(L"error: {}", message);
     }
     if (!errors.empty()) {
+        PrintErrLine(L"run 'vcmic --tray' to pick them from the notification area instead");
         return kExitFailure;
     }
 
@@ -410,7 +391,7 @@ void PrintAutostartInfo(const AutostartInfo& info) {
     PrintLine(L"  edit or remove it in taskschd.msc, or with 'vcmic --uninstall-autostart'");
 }
 
-int RunAutostart(const Options& options) {
+int RunAutostart(const Options& options, const ConfigLocation& location) {
     std::wstring error;
 
     if (options.uninstall_autostart) {
@@ -425,13 +406,14 @@ int RunAutostart(const Options& options) {
     }
 
     if (options.install_autostart) {
-        // The task runs the same executable with --tray, plus whatever config
-        // this invocation was pointed at: installing with -c and then starting
-        // without it would silently mix a different pair of devices.
-        std::wstring arguments = L"--tray";
-        if (!options.config_path.empty()) {
-            arguments += std::format(L" --config \"{}\"", options.config_path.wstring());
-        }
+        // Always the fully resolved path, never what was typed and never
+        // nothing at all. The task starts with a working directory of the
+        // scheduler's choosing, so a relative path means something different
+        // there than it did here - and an omitted one used to mean "look next
+        // to the executable", which is a build output folder on a machine
+        // where vcmic was compiled rather than installed.
+        const std::wstring arguments =
+            std::format(L"--tray --config \"{}\"", location.path.wstring());
 
         std::vector<std::wstring> notes;
         const HRESULT hr = InstallAutostart(options.autostart_delay_s, arguments, notes, error);
@@ -442,6 +424,11 @@ int RunAutostart(const Options& options) {
         PrintLine(L"autostart registered.");
         for (const std::wstring& note : notes) {
             PrintErrLine(L"warning: the scheduler did not accept {}", note);
+        }
+        if (!location.exists) {
+            PrintLine(L"note: {} does not exist yet; the first run will pick the devices and",
+                      location.path.wstring());
+            PrintLine(L"      create it. Check them in the tray menu afterwards.");
         }
         PrintLine();
     }
@@ -575,14 +562,15 @@ int Run(int argc, wchar_t** argv) {
         // No config and no log file needed just to print the endpoint table.
         return RunListDevices(options);
     }
+
+    const ConfigLocation location = ResolveConfigPath(options.config_path);
     if (options.install_autostart || options.uninstall_autostart || options.autostart_status) {
-        // Same: registering a scheduled task says nothing about whether the
-        // devices in the config exist today.
-        return RunAutostart(options);
+        // Registering a scheduled task says nothing about whether the devices
+        // in the config exist today, so the file is located but not read.
+        return RunAutostart(options, location);
     }
 
-    const std::filesystem::path config_path =
-        options.config_path.empty() ? DefaultConfigPath() : options.config_path;
+    const std::filesystem::path& config_path = location.path;
     ConfigLoad loaded = LoadConfigFile(config_path);
     if (options.log_level.has_value()) {
         loaded.config.log.level = *options.log_level;
@@ -599,7 +587,10 @@ int Run(int argc, wchar_t** argv) {
     }
 
     LogSettings log_settings;
-    log_settings.file = ResolveRelativeToExe(loaded.config.log.file);
+    // Next to the config rather than next to the executable: the two belong
+    // together, and "open the log" from the tray should land somewhere the user
+    // can actually write to.
+    log_settings.file = ResolveRelativeTo(config_path.parent_path(), loaded.config.log.file);
     log_settings.level = loaded.config.log.level;
     // --check-config prints its own report, so the log stays file-only there.
     log_settings.console = options.check_config ? false : loaded.config.log.console;
@@ -611,19 +602,26 @@ int Run(int argc, wchar_t** argv) {
 
     int exit_code = kExitOk;
     if (options.check_config) {
-        exit_code = RunCheckConfig(loaded.config, config_path, loaded.file_exists);
+        exit_code = RunCheckConfig(loaded.config, location);
         PrintLine(L"log file    : {}", log_settings.file.wstring());
     } else {
+        LogInfo(L"config: {}{}", config_path.wstring(),
+                loaded.file_exists ? L"" : L" (new)");
+        LogInfo(L"log   : {}", log_settings.file.wstring());
+
         std::vector<std::wstring> engine_errors;
         ValidateForEngine(loaded.config, engine_errors);
-        if (!engine_errors.empty()) {
+        // With an icon there is a menu to fix this from, and the session comes
+        // up in its setup state instead. Without one there is nothing to do but
+        // say so.
+        if (!engine_errors.empty() && !options.tray) {
             for (const std::wstring& message : engine_errors) {
                 LogError(L"{}", message);
             }
+            PrintErrLine(L"run 'vcmic --tray' to pick the devices from the notification area,");
+            PrintErrLine(L"or 'vcmic --list-devices' to fill in {}", config_path.wstring());
             exit_code = kExitFailure;
         } else {
-            LogInfo(L"config: {}", config_path.wstring());
-            LogInfo(L"log   : {}", log_settings.file.wstring());
             exit_code = RunEngine(loaded.config, options, config_path, log_settings.file);
         }
     }

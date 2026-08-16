@@ -1,7 +1,16 @@
-# vcmic configuration.
+# vcmic configuration - the annotated reference for every setting.
 #
-# Copy this file to config.toml next to vcmic.exe and fill in the device ids.
-# Run `vcmic --list-devices` to get them, then `vcmic --check-config` to verify.
+# You do not have to write one of these. `vcmic --tray` on a machine with no
+# config picks the three endpoints itself, writes them to
+# %APPDATA%\vcmic\config.toml, and lets you correct any of it from the menu;
+# the file it writes carries shorter versions of the comments below.
+#
+# To start from this file instead, copy it to %APPDATA%\vcmic\config.toml (or
+# next to vcmic.exe, or anywhere and pass --config) and fill in the device ids
+# from `vcmic --list-devices`, then check it with `vcmic --check-config`.
+#
+# Anything changed from the tray menu is saved back over the file, comments
+# included - so keep hand-written notes somewhere else if they matter.
 #
 # Syntax: a small TOML subset - [sections], `key = value`, `#` or `;` comments,
 # quoted or bare values. No arrays and no nested tables.
@@ -150,7 +159,8 @@ startup_wait_s = 60
 # trace|debug|info|warn|error|off
 level = "info"
 
-# Relative paths resolve next to vcmic.exe, not to the working directory.
+# Relative paths resolve next to this config file, not to the working
+# directory - which the Task Scheduler sets to somewhere else entirely.
 file = "vcmic.log"
 max_bytes = 2097152
 keep_files = 3

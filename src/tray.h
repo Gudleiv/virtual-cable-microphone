@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace vcmic {
 
@@ -14,7 +15,39 @@ enum class TrayState {
     Starting,  // waiting for the configured endpoints to turn up
     Running,   // all three streams up
     Degraded,  // a stream is being rebuilt, or something is muted
+    Setup,     // nothing to run yet: the devices have not been chosen
     Failed,    // stopped, and not because anybody asked it to
+};
+
+// The three endpoints the mixer needs, as the menu talks about them.
+enum class DeviceRole {
+    Chat,        // loopback source: what Discord plays into
+    Microphone,  // shared-mode capture
+    Output,      // the cable ShadowPlay records
+};
+
+// One line in a device submenu.
+struct DeviceChoice {
+    std::wstring id;
+    std::wstring name;
+    bool current = false;
+    bool present = true;  // false for a configured device that is not here now
+};
+
+struct DeviceMenus {
+    std::vector<DeviceChoice> chat;
+    std::vector<DeviceChoice> microphone;
+    std::vector<DeviceChoice> output;
+};
+
+// The settings the menu can show and change. Everything else stays in the file.
+struct TraySettings {
+    double chat_gain_db = 0.0;
+    double mic_gain_db = 0.0;
+    bool limiter = true;
+    bool gate = false;
+    double gate_threshold_db = -45.0;
+    bool drift = true;
 };
 
 // The menu raises these; the owner does the work. Keeping the interface here
@@ -30,9 +63,24 @@ public:
     virtual void OnWriteStatus() = 0;
     virtual void OnExit() = 0;
 
-    // Read just before the menu is built, so the check marks are never stale.
+    // Enumerated once, when the menu opens, so a device plugged in a minute ago
+    // is on the list and one unplugged since is marked as gone.
+    virtual DeviceMenus Devices() = 0;
+    virtual void OnSelectDevice(DeviceRole role, const std::wstring& id,
+                                const std::wstring& name) = 0;
+
+    // `role` is Chat or Microphone; Output has no gain of its own.
+    virtual void OnSetGain(DeviceRole role, double gain_db) = 0;
+    virtual void OnToggleLimiter() = 0;
+    virtual void OnToggleGate() = 0;
+    virtual void OnSetGateThreshold(double threshold_db) = 0;
+    virtual void OnToggleDrift() = 0;
+
+    // Read just before the menu is built, so nothing on it is ever stale.
     virtual bool ChatMuted() const = 0;
     virtual bool MicMuted() const = 0;
+    virtual bool Mixing() const = 0;  // false while starting, in setup, or after a fault
+    virtual TraySettings Settings() const = 0;
 };
 
 // A hidden top-level window and one shell notification icon.
@@ -72,6 +120,7 @@ private:
     bool AddIcon();
     void UpdateIcon();
     void ShowMenu();
+    void Dispatch(int command, const DeviceMenus& devices, const TraySettings& settings);
 
     TrayHost* host_ = nullptr;
     HWND hwnd_ = nullptr;

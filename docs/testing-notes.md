@@ -34,6 +34,19 @@ The sanitizer is the point of the first group: the resampler promises that
 hands it buffers of precisely that size, so a disagreement of even one frame is
 a heap overflow rather than a subtle glitch.
 
+Stage 6's config round trip needs a filesystem and the Windows-only helpers that
+`config.cpp` links against, so it is compiled out of the host build and reported
+as skipped there. To run it, build the same file for Windows and run it under
+Wine — note the absent `-municode`, since the self-test has a plain `main`:
+
+```sh
+x86_64-w64-mingw32-g++ -std=c++20 -O1 -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN \
+    -DNOMINMAX -D_WIN32_WINNT=0x0A00 -Isrc -static -static-libgcc -static-libstdc++ \
+    tools/dsp_selftest.cpp src/drift.cpp src/dynamics.cpp src/config.cpp \
+    src/strings.cpp src/logging.cpp src/paths.cpp src/console.cpp \
+    -o selftest.exe -lole32 -lshell32 -luser32 && wine selftest.exe
+```
+
 | Check | Result |
 |---|---|
 | resampler, ratio 1.0 | pass-through: tone at 0.5000, residual 138 dB down |
@@ -48,6 +61,14 @@ a heap overflow rather than a subtle glitch.
 | limiter | nothing exceeds the threshold, bit-transparent below it |
 | gate | −60 dBFS noise stays shut, −20 dBFS speech passes at unity |
 | live reload of the dynamics (stage 5) | a limiter mid-peak keeps holding it down across the reload, a gate open on a voice stays open, switching the limiter off gets out of the way, and `Configure` still resets a freshly opened stream |
+| config round trip (stage 6, Windows build) | a config with no default values in it survives save → load unchanged, quotes, ampersands, Cyrillic and backslashed paths included; every key written is a key the reader knows; saving what was just loaded is byte-identical |
+
+The middle check of that last row is the one worth having. A key the writer and
+the reader spell differently would not fail: it would come back as `unknown key
+(ignored)`, and that setting would quietly revert to its default the next time
+vcmic started. The third catches the opposite problem — a value that does not
+survive its own formatting would have the tray rewriting the file on every
+start.
 
 The timing noise in the simulated source is calibrated against the machine
 rather than invented. A ten-minute session there ran the loop at
@@ -378,23 +399,122 @@ microphone at the size that actually matters.
 
 ### On the machine, for stage 5
 
-1. **`--install-autostart`, then `--autostart-status`.** Everything in that
-   output comes back from the scheduler rather than from what was just sent, so
-   it doubles as the read-back test. Check the delay, the command and that it
-   runs as the right account. `taskschd.msc` should show it in the root folder.
-2. **Log out and back in.** The icon should appear about `--logon-delay` seconds
-   later, green, with no console window flashing on the way. The log will say
-   how many attempts the devices took — that number is the one that says whether
-   30 s is enough on this machine.
-3. **Reboot with the GC7 unplugged**, plug it in during the startup window, and
-   confirm it starts anyway rather than exiting.
-4. **Mute chat, then mute the microphone**, and confirm both in a recording as
-   well as in the icon colour. The mute rides the gain smoothing, so it should
-   be inaudible rather than a click.
-5. **Reload config** after editing a gain, and separately after editing a device
-   id. The first should take effect on the next word spoken; the second should
-   refuse with a balloon and keep mixing on the old values.
+1. **`--install-autostart`, then `--autostart-status`.** — done, and it found a
+   bug; see stage 6 below. The task registered and ran, but with no `--config`
+   recorded it looked next to the executable, which is `build\bin\Release`, and
+   stopped on an empty device list.
+2. **Log out and back in.** — deferred to stage 6.
+3. **Reboot with the GC7 unplugged** — deferred to stage 6.
+4. **Mute chat, then mute the microphone** — done, both work.
+5. **Reload config** — deferred to stage 6, where what it does with a device
+   change is no longer "refuse".
 6. **Restart explorer** (`taskkill /f /im explorer.exe`, then start it again).
-   The icon should come back on its own.
+   The icon should come back on its own. — deferred to stage 6.
 7. **Shut Windows down with vcmic running** and check the log ends with the
-   session summary rather than stopping mid-line.
+   session summary rather than stopping mid-line. — deferred to stage 6.
+
+A 2.5-minute session from that run, mixing both live sources, is the first
+recorded on the real hardware with the tray in the way:
+
+| | chat (GC7 loopback) | mic (fifine) | render (CABLE-A) |
+|---|---|---|---|
+| fill, average | 39.9 ms | 39.4 ms | — |
+| learned drift | −22 ppm | **+163 ppm** | — |
+| discontinuities | 1 | 3 | — |
+| underruns / overruns / resyncs | 0 / 0 / 0 | 0 / 0 / 0 | — |
+| limiter | — | — | never engaged, 0 clipped samples |
+| callbacks | — | — | 14 373, no timeouts |
+
+Both clocks sit far inside the ±1000 ppm the loop can absorb, and the fifine's
++163 ppm is a property of that device rather than a fault. Its three
+discontinuities against the GC7's one are the same USB fault stage 4 recorded,
+still unresolved on the hardware side and still costing nothing measurable.
+
+## Stage 6: settings in the tray, and where the config lives
+
+Stage 5's autostart check failed on the machine, and the reason turned out to be
+worth more than the fix. `--install-autostart` recorded `--config` only when the
+installing command line had one, and the fallback — `config.toml` next to the
+executable — resolves to `build\bin\Release\config.toml` on a machine where
+vcmic was compiled rather than installed. The task started, found no settings,
+and stopped on an empty device list. Nothing was wrong with the scheduler code;
+the default location was wrong.
+
+That location was wrong in a second way too. A settings file that only a text
+editor can produce means the first thing a new machine does is fail, and the
+recovery is a `--list-devices` dump and a paste of two GUIDs.
+
+So stage 6 moves both: settings default to `%APPDATA%\vcmic\config.toml`, the
+task always records the fully resolved absolute path, and the tray menu becomes
+the place the settings are set — the three endpoints, the two volumes, the
+limiter, the gate and its threshold, and drift. Every change is written back
+immediately, so what is running and what is saved cannot diverge.
+
+Changing a device could not be done live. Each stream sizes its buffers and
+configures its drift controller as it opens, so the engine stops and reopens —
+about a second, announced in the tooltip. That mechanism then paid for itself
+twice: **reload from the file** now restarts too when the file differs in
+anything a running engine cannot take, instead of reporting the change as
+refused and leaving the user to work out what to do about it.
+
+### What ran here
+
+The Wine rig, with the three PulseAudio null sinks, one of them renamed to
+`CABLE-A Input` so the first-run guess has something to find (`pacmd
+update-sink-proplist cable 'device.description="CABLE-A Input"'` — the same
+thing through `pactl load-module sink_properties=` fails on the space).
+
+| Check | Result |
+|---|---|
+| `SHGetKnownFolderPath(FOLDERID_RoamingAppData)` | resolves under Wine; `--help` prints the real path in the search order |
+| first run, no config, no devices | comes up amber in the setup state, names all three missing roles, waits — and does **not** write a half-guessed file |
+| first run, no config, devices present | guesses all three, logs each one and a warning that they are guesses, writes `%APPDATA%\vcmic\config.toml` with id *and* friendly name for each |
+| the file it wrote | reads back clean; the whole round trip is now in the self-test |
+| start failure with a tray | says "waiting for the devices; pick different ones from the tray menu" and keeps waiting, instead of exiting 2 |
+| start failure without a tray | still exits 2 immediately, with a pointer to `--tray` and to the config path it used |
+| the log | follows the config to `%APPDATA%\vcmic\`, and the directory is created on the way |
+
+The device guess picked Wine's `PulseAudio Output` and `PulseAudio Input` as the
+communications defaults and the renamed sink as the cable, which is exactly the
+intended shape of the guess: two defaults and one name match.
+
+### Everything this rig still could not check
+
+- **The menu itself.** Wine renders the window and the icon, but nothing here
+  clicks a submenu. The device lists, the radio marks, the gain ladders and the
+  restart-on-selection path are all compiled and reachable but unexercised.
+- **Task registration**, still: Wine answers `E_NOTIMPL` for logon triggers, so
+  the corrected `--config` argument has never been read back out of a real
+  scheduler.
+- **Anything requiring loopback.** `AUDCLNT_E_WRONG_ENDPOINT_TYPE` is still the
+  wall; the engine cannot reach a running state here, so a device change on a
+  *running* mixer has not been timed.
+
+### On the machine, for stage 6
+
+1. **Delete `%APPDATA%\vcmic\config.toml` if one exists, then `vcmic --tray`
+   with no arguments.** It should pick three devices, raise a balloon saying so,
+   and start. The chat source is the one to check: the guess takes the default
+   communications device, which is right only if that is what Discord plays
+   into.
+2. **Pick each of the three from the menu**, including picking one that is
+   already selected — that last one must be a no-op, not a restart. Changing one
+   should stop and restart the mixer within about a second, and the tooltip
+   should say what it is doing.
+3. **Unplug the fifine and open the menu.** It should still be listed, marked
+   `(not connected)`, with the radio mark still on it.
+4. **Nudge the microphone volume ±1 dB and pick a ladder value**, while somebody
+   is talking. Neither should click, and the submenu title should show the value
+   in both cases. Check `%APPDATA%\vcmic\config.toml` afterwards — it should
+   already contain what the menu says.
+5. **`--install-autostart`, then `--autostart-status`** — the command line read
+   back out of the scheduler must now carry `--config` with an absolute path.
+   Then run the task from `taskschd.msc`: this is the exact step that failed in
+   stage 5.
+6. Then the five stage-5 checks that were deferred: log out and back in, reboot
+   with the GC7 unplugged, reload from the file, restart explorer, shut Windows
+   down with vcmic running.
+
+Note for step 6's reload check: a device id edited in the file now restarts the
+mixer onto it rather than refusing, so the thing to confirm is that the mixer
+comes back on the new device, not that it declines.

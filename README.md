@@ -48,13 +48,16 @@ The full specification is in [`docs/gc7-virtual-mic-spec.md`](docs/gc7-virtual-m
 | 3 | drift compensation, limiter, noise gate | **done** |
 | 4 | `IMMNotificationClient`, device-invalidation recovery, backoff | **done** |
 | 5 | tray icon, autostart | **done** |
+| 6 | settings in the tray, config in `%APPDATA%`, first run with no config | **done** |
 
 Running `vcmic` with no mode option mixes chat and microphone into the cable
 until Ctrl+C, correcting for the three clocks as it goes, and rebuilding any of
 the three streams that loses its device. `vcmic --tray` does the same behind an
-icon in the notification area, and `vcmic --install-autostart` makes that happen
-at log on. See [`docs/testing-notes.md`](docs/testing-notes.md) for what has
-been measured and what has not.
+icon in the notification area, where the three endpoints, the two volumes and
+the processing can all be set from the menu, and `vcmic --install-autostart`
+makes that happen at log on. See
+[`docs/testing-notes.md`](docs/testing-notes.md) for what has been measured and
+what has not.
 
 Stage 4 left a device missing **at startup** as a fatal error, on the grounds
 that telling a misconfigured id apart from an unplugged one is worth more at
@@ -62,7 +65,17 @@ that moment than starting anyway. Autostart makes that distinction impossible to
 draw — at log on the USB stack is still enumerating — so stage 5 gives startup
 its own retry window, `resilience.startup_wait_s`, defaulting to a minute. Run
 by hand with `startup_wait_s = 0` and the old behaviour is back: a wrong id
-fails immediately instead of hanging about.
+fails immediately instead of hanging about. With a tray icon there is a menu to
+fix it from, so stage 6 goes further: the wait never expires, because an
+endpoint that turns up ten minutes late is still worth picking up and the icon
+is there to say what is being waited for.
+
+Stage 6 also settled where a config lives. Stage 5 looked for it next to the
+executable, which on a machine where vcmic was compiled rather than installed is
+a build output folder — so `--install-autostart` registered a task that started,
+found no settings, and stopped. Settings now default to
+`%APPDATA%\vcmic\config.toml`, the autostart task always records the resolved
+absolute path, and none of it has to exist beforehand.
 
 ## Requirements
 
@@ -106,7 +119,7 @@ vcmic --tray             the same, with an icon in the notification area
 vcmic --list-devices     list every audio endpoint with id, roles and mix format
 vcmic --active-only ...  with --list-devices: hide disabled/unplugged endpoints
 vcmic --check-config     resolve the configured devices and validate formats
-vcmic --config <path>    config file (default: config.toml next to the exe)
+vcmic --config <path>    settings file, instead of the one found by default
 vcmic --log-level <lvl>  trace|debug|info|warn|error|off
 vcmic --version
 vcmic --help
@@ -118,6 +131,25 @@ vcmic --autostart-status       print what is registered
 ```
 
 Exit codes: `0` success, `1` bad command line, `2` failure.
+
+`vcmic --tray` needs no arguments and no settings file. On a machine that has
+neither it guesses the three endpoints — the default communications devices for
+chat and microphone, whatever calls itself a VB-CABLE for the output — writes
+them to `%APPDATA%\vcmic\config.toml`, and says so both in the log and in a
+balloon. Anything it got wrong is one menu away. If it cannot fill all three the
+icon comes up amber and the menu is the only thing that has to happen next.
+
+Where settings are read from, in order:
+
+1. the path given to `--config`
+2. `%APPDATA%\vcmic\config.toml`
+3. `config.toml` next to `vcmic.exe`, for a portable copy
+
+The log follows whichever one wins, so `%APPDATA%\vcmic\vcmic.log` by default.
+Roaming rather than local because that is the folder people know how to find;
+the one genuinely machine-specific thing in there is the endpoint ids, and a
+config that roams onto a machine without those devices comes up in the tray's
+setup state rather than doing any harm.
 
 Only one mixer runs per session. A second `vcmic` finds the first holding a
 named mutex and exits straight away rather than fighting it for the cable.
@@ -272,16 +304,19 @@ real stream on somebody else's output device; it is on in this machine's
 
 ### Setting it up
 
-`config.toml` in the repository root is already filled in for this machine from
-the survey in [`docs/devices-2026-08-12.md`](docs/devices-2026-08-12.md), so the
-check is just:
+The short version is `vcmic --tray`, then check the three endpoints in its menu
+and pick `CABLE-A Output` as the microphone in ShadowPlay. Everything below is
+for doing it by hand, or for understanding what the menu chose.
+
+`config.toml` in the repository root is the survey record for this machine, from
+[`docs/devices-2026-08-12.md`](docs/devices-2026-08-12.md). It is not on the
+search path any more — settings live in `%APPDATA%\vcmic\config.toml` — so
+either point at it explicitly or install it:
 
 ```powershell
 build\bin\Release\vcmic.exe --check-config --config config.toml
+copy config.toml "$env:APPDATA\vcmic\config.toml"
 ```
-
-`--config` takes a path relative to the current directory; without it, vcmic
-reads `config.toml` next to the executable.
 
 To redo the survey after a hardware change:
 
@@ -294,7 +329,8 @@ To redo the survey after a hardware change:
    Every endpoint is listed with its state, so devices that Windows currently
    hides also show up.
 
-2. Paste the ids into `config.toml`. The bottom of the `--list-devices` output
+2. Either pick them from the tray menu, which writes them out for you, or paste
+   the ids into the config by hand. The bottom of the `--list-devices` output
    contains a guessed `[devices]` block to start from — check it rather than
    trust it. `config.example.toml` documents every available setting.
 
@@ -308,31 +344,51 @@ To redo the survey after a hardware change:
 
 `vcmic --tray` puts a microphone in the notification area, coloured by state:
 green when all three streams are up, amber while one is being rebuilt or
-something is muted, red when the mixer has stopped. The tooltip spells out
-which. Muted counts as amber on purpose — a forgotten mute produces a recording
-with half the audio missing, and the icon is the only thing that would have said
-so before the clip was already made.
+something is muted or the devices have not been chosen yet, red when the mixer
+has stopped. The tooltip spells out which. Muted counts as amber on purpose — a
+forgotten mute produces a recording with half the audio missing, and the icon is
+the only thing that would have said so before the clip was already made.
 
-The menu has mute chat, mute microphone, reload config, write a counter report
-to the log now, open the log, open the config, and exit.
+The menu is the whole settings surface:
 
-Muting is a gain of zero rather than a bypass, so it rides the same
-`mix.gain_smoothing_ms` ramp as any other gain change and does not click.
+- **Mute chat**, **mute microphone**
+- **Chat source**, **Microphone**, **Output** — every endpoint Windows currently
+  has, with the configured one marked. A configured device that is not plugged
+  in is listed too, as `(not connected)`, so the menu can still answer "what is
+  this set to".
+- **Chat volume**, **Microphone volume** — a ladder from −24 to +12 dB, finer
+  near unity, plus ±1 dB nudges for anything in between. The current value is in
+  the submenu's title, because a nudged value is not on the ladder.
+- **Processing** — limiter, noise gate, gate threshold, drift compensation.
+- **Reload settings from the file**, **write a counter report to the log now**,
+  **open the log**, **open the config file**, **exit**.
 
-**Reload config** re-reads the file and applies what can be applied to a running
-engine: the two gains, the smoothing time, the limiter, the gate, the log level
-and the report interval. Anything that sized a buffer or opened a device —
-`[devices]`, `[audio]`, `[drift]`, `[resilience]`, the log file itself — is
-listed in the log and in a balloon as needing a restart, and the old values keep
-running. A config with errors is refused whole; nothing is applied by halves.
+Every change is written straight back to the config file, so what is running and
+what is saved never diverge. The file is rewritten whole and generated with its
+own comments; hand-written ones do not survive a change made from the menu.
+
+Changes divide into two kinds. **The two gains, the limiter and the gate** are
+applied to the running engine — the audio does not stop and nothing clicks,
+because a gain change of any kind rides the `mix.gain_smoothing_ms` ramp and mute
+is simply a gain of zero. **A different endpoint, or the drift setting**, cannot
+be slipped underneath a running stream: each stream sizes its buffers and
+configures its drift controller as it opens. Those stop and reopen the engine,
+which takes about a second and is announced in the tooltip.
+
+**Reload settings from the file** does the same triage: if the file only differs
+in the live settings it is applied without a gap, and otherwise the mixer
+restarts onto it. Either way what ends up running is what the file says. A file
+with errors is refused whole; nothing is applied by halves.
 
 The icon is drawn at run time rather than shipped as a resource, so it comes out
 at whatever `SM_CXSMICON` says and there is no `.ico` in the repository.
 
 Everything above happens on the main thread. The audio threads never touch a
 window, and the tray never touches WASAPI: mute reaches the render thread as one
-relaxed store, and a reload as one release/acquire flag, both read at a block
-boundary.
+relaxed store, and a live settings change as one release/acquire flag, both read
+at a block boundary. Enumerating the endpoints for the menu, computing filter
+coefficients and writing the file all happen on the message thread, where a
+blocking call costs a moment of menu latency and nothing else.
 
 ### Autostart, and why this is not a Windows service
 
@@ -347,10 +403,17 @@ vcmic --uninstall-autostart
 ```
 
 That registers a per-user task called `vcmic` in the root folder of
-`taskschd.msc`, running this executable with `--tray`. It needs no
-administrator rights: a task that runs as you, with an interactive token, is
-yours to create. If you started vcmic with `--config <path>`, that path is
-registered with it.
+`taskschd.msc`, running this executable with `--tray --config <path>`. It needs
+no administrator rights: a task that runs as you, with an interactive token, is
+yours to create.
+
+The config path recorded is always the fully resolved absolute one — whatever
+`--config` was given, or whichever file the search order found, or the
+`%APPDATA%` path a first run will create. Never what was typed, because the task
+starts with a working directory of the scheduler's choosing, and never nothing
+at all, because that used to mean "look next to the executable" and land in a
+build output folder. `--autostart-status` prints the command line as registered,
+read back out of the scheduler rather than out of what was just sent to it.
 
 Several of the scheduler's defaults are actively wrong for a resident audio
 mixer, and the installer overrides all of them:
@@ -375,13 +438,18 @@ config explains is worse than one that fails out loud.
 
 ## Configuration
 
-`config.toml` sits next to the executable. See `config.example.toml` for the
-full annotated list. Device matching uses `IMMDevice::GetId()`; the
-`*_name` keys are a substring fallback that logs a warning whenever it is used,
-because friendly names are localized and change on re-enumeration.
+Settings default to `%APPDATA%\vcmic\config.toml`; see the search order under
+[Usage](#usage), and `config.example.toml` for the full annotated list of
+settings. Nothing has to be written by hand — the tray menu covers the devices,
+the volumes and the processing, and writes the file itself.
 
-The log file is written next to the executable too, and rotates by size
-(`log.max_bytes`, `log.keep_files`).
+Device matching uses `IMMDevice::GetId()`. The `*_name` keys are a substring
+fallback that logs a warning whenever it is used, because friendly names are
+localized and change on re-enumeration; the tray writes both, so a device whose
+id changes under a driver reinstall is still found by name.
+
+The log file is written next to the config, wherever that turned out to be, and
+rotates by size (`log.max_bytes`, `log.keep_files`).
 
 ## Known external pitfalls
 
@@ -422,10 +490,10 @@ config.example.toml     annotated configuration template
 docs/                   the specification this is built from
 src/
   main.cpp              command line, --list-devices, --check-config, autostart
-  session.*             the run loop: startup wait, message pump, tray callbacks
-  tray.*                the notification-area icon, its menu and its artwork
+  session.*             the run loop: startup wait, setup state, restarts, tray callbacks
+  tray.*                the notification-area icon, its menus and its artwork
   autostart.*           the Task Scheduler logon task
-  device_registry.*     endpoint enumeration, properties, id/name resolution
+  device_registry.*     endpoint enumeration, properties, id/name resolution, first guess
   device_watcher.*      IMMNotificationClient: wakes a broken stream early
   audio_format.*        WAVEFORMATEXTENSIBLE inspection and formatting
   audio_engine.*        the three streams, the mixer and the render callback
@@ -434,7 +502,7 @@ src/
   ring_buffer.h         lock-free SPSC ring of deinterleaved stereo float32
   sample_convert.*      capture/render format conversion, downmix and upmix
   audio_stats.h         the counters the audio threads publish
-  config.*              the TOML-subset parser and the typed configuration
+  config.*              the TOML-subset parser and writer, and where the file lives
   logging.*             levelled, rotating log file
   console.*             UTF-16/UTF-8 console output
   com.h                 ComPtr, PROPVARIANT and apartment RAII
