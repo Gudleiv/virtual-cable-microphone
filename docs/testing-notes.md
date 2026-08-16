@@ -20,9 +20,9 @@ Two portability details fall out of it and are worth keeping:
 
 ## Offline self-test
 
-`tools/dsp_selftest.cpp` exercises everything stage 3 added without any audio
-hardware at all — the drift and dynamics headers pull in no Windows API, so it
-compiles and runs anywhere:
+`tools/dsp_selftest.cpp` exercises everything stage 3 added, plus stage 5's live
+reconfiguration, without any audio hardware at all — the drift and dynamics
+headers pull in no Windows API, so it compiles and runs anywhere:
 
 ```sh
 g++ -std=c++20 -O1 -fsanitize=address,undefined -Isrc \
@@ -33,6 +33,19 @@ The sanitizer is the point of the first group: the resampler promises that
 `InputFramesNeeded()` is exactly what `Process()` will consume, and the test
 hands it buffers of precisely that size, so a disagreement of even one frame is
 a heap overflow rather than a subtle glitch.
+
+Stage 6's config round trip needs a filesystem and the Windows-only helpers that
+`config.cpp` links against, so it is compiled out of the host build and reported
+as skipped there. To run it, build the same file for Windows and run it under
+Wine — note the absent `-municode`, since the self-test has a plain `main`:
+
+```sh
+x86_64-w64-mingw32-g++ -std=c++20 -O1 -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN \
+    -DNOMINMAX -D_WIN32_WINNT=0x0A00 -Isrc -static -static-libgcc -static-libstdc++ \
+    tools/dsp_selftest.cpp src/drift.cpp src/dynamics.cpp src/config.cpp \
+    src/strings.cpp src/logging.cpp src/paths.cpp src/console.cpp \
+    -o selftest.exe -lole32 -lshell32 -luser32 && wine selftest.exe
+```
 
 | Check | Result |
 |---|---|
@@ -47,6 +60,15 @@ a heap overflow rather than a subtle glitch.
 | beyond the ceiling (5000 ppm) | correction saturates, resync valve fires, fill still bounded |
 | limiter | nothing exceeds the threshold, bit-transparent below it |
 | gate | −60 dBFS noise stays shut, −20 dBFS speech passes at unity |
+| live reload of the dynamics (stage 5) | a limiter mid-peak keeps holding it down across the reload, a gate open on a voice stays open, switching the limiter off gets out of the way, and `Configure` still resets a freshly opened stream |
+| config round trip (stage 6, Windows build) | a config with no default values in it survives save → load unchanged, quotes, ampersands, Cyrillic and backslashed paths included; every key written is a key the reader knows; saving what was just loaded is byte-identical |
+
+The middle check of that last row is the one worth having. A key the writer and
+the reader spell differently would not fail: it would come back as `unknown key
+(ignored)`, and that setting would quietly revert to its default the next time
+vcmic started. The third catches the opposite problem — a value that does not
+survive its own formatting would have the tray rewriting the file on every
+start.
 
 The timing noise in the simulated source is calibrated against the machine
 rather than invented. A ten-minute session there ran the loop at
@@ -308,3 +330,191 @@ the channels that would show it (`USB-USBHUB3-Analytic`,
 `DriverFrameworks-UserMode`) ship disabled — so finding nothing is the expected
 result whether or not the bus misbehaved. The decisive test is still a session
 with vcmic closed.
+
+## Stage 5: tray, autostart and the startup window
+
+Stage 5 is mostly user-interface, which the Wine rig turns out to cover better
+than it covers audio: `winepulse` cannot do loopback, but Wine's `user32`,
+`gdi32` and shell notification area are all real enough to exercise.
+
+### What ran here
+
+| Check | Result |
+|---|---|
+| cross-compile, `-Wall -Wextra` | every file clean, links against `taskschd`, `secur32`, `user32`, `gdi32`, `shell32` |
+| DSP self-test after splitting the dynamics coefficients from their state | every stage 1-3 check unchanged, plus four new ones for the reload |
+| `--help`, bad `--logon-delay` | usage printed, `--logon-delay 99999` rejected with exit 1 |
+| `--autostart-status` with nothing registered | "not registered", exit 0 |
+| `--install-autostart` | reaches `ITriggerCollection::Create`, which Wine answers `E_NOTIMPL` — see below |
+| startup wait, device that never appears | one WARN, then quiet, gave up at the 6 s deadline plus the last backoff, exit 2 |
+| second instance while the first was waiting | refused in 1 ms with "another vcmic is already mixing in this session" |
+| `--tray` against a device that never appears | icon created, state driven to Failed, balloon shown, 10 s grace, clean exit |
+
+The tray line is the interesting one: no `no tray icon:` warning appeared, which
+means `RegisterClassEx`, the hidden top-level window, `CreateDIBSection` +
+`CreateIconIndirect` for the runtime-drawn glyph, `Shell_NotifyIcon(NIM_ADD)` and
+`NIM_SETVERSION` at version 4 all succeeded, and the whole thing tore down
+without complaint.
+
+### Everything the scheduler path could not reach
+
+Wine implements `ITaskService` far enough to be useful and then stops. What
+*did* run: `CoCreateInstance`, `Connect`, `GetFolder`, `NewTask`,
+`get_RegistrationInfo` with both puts, `get_Principal` with all three, every
+`ITaskSettings` put in `ApplySettings`, `get_IdleSettings`, and `get_Triggers`.
+What did not: `ITriggerCollection::Create(TASK_TRIGGER_LOGON)` returns
+`E_NOTIMPL`, so the trigger, the action, `RegisterTaskDefinition` and the whole
+of `QueryAutostart`'s read-back are unverified.
+
+That is also why the task is built through the object model rather than as XML
+handed to `put_XmlText`. The XML route is less code, but its schema cares about
+element order in ways that are easy to get subtly wrong, and the failure would
+land on the target machine at registration time. Every object-model call is a
+named method instead, so a mistake is a compile error in the MSVC build rather
+than a runtime surprise.
+
+One deliberate consequence: `ApplySettings` collects the `put_` calls the
+scheduler declines and the caller prints them as warnings. A task that registers
+and then behaves in a way nothing in the config explains is worse than one that
+fails out loud.
+
+`mingw-w64`'s `taskschd.h` stops short of `ILogonTrigger` — every other
+interface used here is present. Rather than lose the cross-compile check over
+one missing declaration, `autostart.cpp` declares it behind
+`#ifndef __ILogonTrigger_INTERFACE_DEFINED__`, the guard macro the generated
+headers define themselves, so MSVC never compiles a line of it.
+
+### The icon
+
+The glyph is computed rather than shipped: a capsule, a cradle arc and a stand,
+sampled 4×4 per pixel into a premultiplied BGRA DIB. Drawing it with GDI would
+have been shorter and wrong — GDI leaves the alpha channel alone, and the
+notification area composites with it.
+
+It was checked by rendering the same shape function on the host at 16, 24, 32
+and 64 pixels over both a light and a dark background. The first attempt read as
+a tree: the capsule was nearly circular and the base nearly as wide as it. The
+cradle arc, worth about 1.2 px at 16, is what makes the silhouette read as a
+microphone at the size that actually matters.
+
+### On the machine, for stage 5
+
+1. **`--install-autostart`, then `--autostart-status`.** — done, and it found a
+   bug; see stage 6 below. The task registered and ran, but with no `--config`
+   recorded it looked next to the executable, which is `build\bin\Release`, and
+   stopped on an empty device list.
+2. **Log out and back in.** — deferred to stage 6.
+3. **Reboot with the GC7 unplugged** — deferred to stage 6.
+4. **Mute chat, then mute the microphone** — done, both work.
+5. **Reload config** — deferred to stage 6, where what it does with a device
+   change is no longer "refuse".
+6. **Restart explorer** (`taskkill /f /im explorer.exe`, then start it again).
+   The icon should come back on its own. — deferred to stage 6.
+7. **Shut Windows down with vcmic running** and check the log ends with the
+   session summary rather than stopping mid-line. — deferred to stage 6.
+
+A 2.5-minute session from that run, mixing both live sources, is the first
+recorded on the real hardware with the tray in the way:
+
+| | chat (GC7 loopback) | mic (fifine) | render (CABLE-A) |
+|---|---|---|---|
+| fill, average | 39.9 ms | 39.4 ms | — |
+| learned drift | −22 ppm | **+163 ppm** | — |
+| discontinuities | 1 | 3 | — |
+| underruns / overruns / resyncs | 0 / 0 / 0 | 0 / 0 / 0 | — |
+| limiter | — | — | never engaged, 0 clipped samples |
+| callbacks | — | — | 14 373, no timeouts |
+
+Both clocks sit far inside the ±1000 ppm the loop can absorb, and the fifine's
++163 ppm is a property of that device rather than a fault. Its three
+discontinuities against the GC7's one are the same USB fault stage 4 recorded,
+still unresolved on the hardware side and still costing nothing measurable.
+
+## Stage 6: settings in the tray, and where the config lives
+
+Stage 5's autostart check failed on the machine, and the reason turned out to be
+worth more than the fix. `--install-autostart` recorded `--config` only when the
+installing command line had one, and the fallback — `config.toml` next to the
+executable — resolves to `build\bin\Release\config.toml` on a machine where
+vcmic was compiled rather than installed. The task started, found no settings,
+and stopped on an empty device list. Nothing was wrong with the scheduler code;
+the default location was wrong.
+
+That location was wrong in a second way too. A settings file that only a text
+editor can produce means the first thing a new machine does is fail, and the
+recovery is a `--list-devices` dump and a paste of two GUIDs.
+
+So stage 6 moves both: settings default to `%APPDATA%\vcmic\config.toml`, the
+task always records the fully resolved absolute path, and the tray menu becomes
+the place the settings are set — the three endpoints, the two volumes, the
+limiter, the gate and its threshold, and drift. Every change is written back
+immediately, so what is running and what is saved cannot diverge.
+
+Changing a device could not be done live. Each stream sizes its buffers and
+configures its drift controller as it opens, so the engine stops and reopens —
+about a second, announced in the tooltip. That mechanism then paid for itself
+twice: **reload from the file** now restarts too when the file differs in
+anything a running engine cannot take, instead of reporting the change as
+refused and leaving the user to work out what to do about it.
+
+### What ran here
+
+The Wine rig, with the three PulseAudio null sinks, one of them renamed to
+`CABLE-A Input` so the first-run guess has something to find (`pacmd
+update-sink-proplist cable 'device.description="CABLE-A Input"'` — the same
+thing through `pactl load-module sink_properties=` fails on the space).
+
+| Check | Result |
+|---|---|
+| `SHGetKnownFolderPath(FOLDERID_RoamingAppData)` | resolves under Wine; `--help` prints the real path in the search order |
+| first run, no config, no devices | comes up amber in the setup state, names all three missing roles, waits — and does **not** write a half-guessed file |
+| first run, no config, devices present | guesses all three, logs each one and a warning that they are guesses, writes `%APPDATA%\vcmic\config.toml` with id *and* friendly name for each |
+| the file it wrote | reads back clean; the whole round trip is now in the self-test |
+| start failure with a tray | says "waiting for the devices; pick different ones from the tray menu" and keeps waiting, instead of exiting 2 |
+| start failure without a tray | still exits 2 immediately, with a pointer to `--tray` and to the config path it used |
+| the log | follows the config to `%APPDATA%\vcmic\`, and the directory is created on the way |
+
+The device guess picked Wine's `PulseAudio Output` and `PulseAudio Input` as the
+communications defaults and the renamed sink as the cable, which is exactly the
+intended shape of the guess: two defaults and one name match.
+
+### Everything this rig still could not check
+
+- **The menu itself.** Wine renders the window and the icon, but nothing here
+  clicks a submenu. The device lists, the radio marks, the gain ladders and the
+  restart-on-selection path are all compiled and reachable but unexercised.
+- **Task registration**, still: Wine answers `E_NOTIMPL` for logon triggers, so
+  the corrected `--config` argument has never been read back out of a real
+  scheduler.
+- **Anything requiring loopback.** `AUDCLNT_E_WRONG_ENDPOINT_TYPE` is still the
+  wall; the engine cannot reach a running state here, so a device change on a
+  *running* mixer has not been timed.
+
+### On the machine, for stage 6
+
+1. **Delete `%APPDATA%\vcmic\config.toml` if one exists, then `vcmic --tray`
+   with no arguments.** It should pick three devices, raise a balloon saying so,
+   and start. The chat source is the one to check: the guess takes the default
+   communications device, which is right only if that is what Discord plays
+   into.
+2. **Pick each of the three from the menu**, including picking one that is
+   already selected — that last one must be a no-op, not a restart. Changing one
+   should stop and restart the mixer within about a second, and the tooltip
+   should say what it is doing.
+3. **Unplug the fifine and open the menu.** It should still be listed, marked
+   `(not connected)`, with the radio mark still on it.
+4. **Nudge the microphone volume ±1 dB and pick a ladder value**, while somebody
+   is talking. Neither should click, and the submenu title should show the value
+   in both cases. Check `%APPDATA%\vcmic\config.toml` afterwards — it should
+   already contain what the menu says.
+5. **`--install-autostart`, then `--autostart-status`** — the command line read
+   back out of the scheduler must now carry `--config` with an absolute path.
+   Then run the task from `taskschd.msc`: this is the exact step that failed in
+   stage 5.
+6. Then the five stage-5 checks that were deferred: log out and back in, reboot
+   with the GC7 unplugged, reload from the file, restart explorer, shut Windows
+   down with vcmic running.
+
+Note for step 6's reload check: a device id edited in the file now restarts the
+mixer onto it rather than refusing, so the thing to confirm is that the mixer
+comes back on the new device, not that it declines.

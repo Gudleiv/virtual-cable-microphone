@@ -34,8 +34,24 @@ struct DynamicsBlock {
 // modulating everything behind it.
 class PeakLimiter {
 public:
+    // Everything a reload changes, and nothing the stage is currently doing.
+    // Computing these costs an exp() and a pow(), which is why the tray thread
+    // works them out and the render thread only copies them in (spec 4.10).
+    struct Settings {
+        bool enabled = false;
+        float threshold = 1.0f;
+        float release = 1.0f;
+    };
+
+    static Settings SettingsFrom(const MixConfig& mix, std::uint32_t rate);
+
     void Configure(const MixConfig& mix, std::uint32_t rate);
     void Reset() noexcept { gain_ = 1.0f; }
+
+    // Audio path. Deliberately leaves `gain_` alone: a reload that arrives
+    // while the limiter is riding a peak must not drop the gain reduction and
+    // let that peak through.
+    void Adopt(const Settings& settings) noexcept;
 
     bool enabled() const noexcept { return enabled_; }
     float threshold() const noexcept { return threshold_; }
@@ -58,8 +74,26 @@ private:
 // one that opens it, so a voice sitting on the threshold does not chatter.
 class NoiseGate {
 public:
+    // As above: the coefficients a reload replaces, kept apart from the
+    // detector and the envelope so that adopting them mid-word is inaudible.
+    struct Settings {
+        bool enabled = false;
+        float open_threshold = 0.0f;
+        float close_threshold = 0.0f;
+        float attack = 1.0f;
+        float release = 1.0f;
+        float detector = 1.0f;
+        std::uint32_t hold_frames = 0;
+    };
+
+    static Settings SettingsFrom(const GateConfig& gate, std::uint32_t rate);
+
     void Configure(const GateConfig& gate, std::uint32_t rate);
     void Reset() noexcept;
+
+    // Audio path. Keeps the envelope and the current gain, so a gate that is
+    // open on somebody's voice stays open across a reload.
+    void Adopt(const Settings& settings) noexcept;
 
     bool enabled() const noexcept { return enabled_; }
 

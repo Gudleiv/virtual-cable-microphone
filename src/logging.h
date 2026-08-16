@@ -39,6 +39,8 @@ public:
     static void Shutdown();
 
     static LogLevel Level();
+    // The one setting a config reload can change without reopening the file.
+    static void SetLevel(LogLevel level);
     static bool Enabled(LogLevel level) { return static_cast<int>(level) >= static_cast<int>(Level()); }
 
     static void Write(LogLevel level, std::wstring_view message);

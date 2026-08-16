@@ -134,6 +134,12 @@ LogLevel Logger::Level() {
     return state.initialized ? state.settings.level : LogLevel::Info;
 }
 
+void Logger::SetLevel(LogLevel level) {
+    LoggerState& state = State();
+    std::scoped_lock lock(state.mutex);
+    state.settings.level = level;
+}
+
 void Logger::Write(LogLevel level, std::wstring_view message) {
     LoggerState& state = State();
     std::scoped_lock lock(state.mutex);

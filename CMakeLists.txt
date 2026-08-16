@@ -25,6 +25,7 @@ add_executable(vcmic
     src/main.cpp
     src/audio_engine.cpp
     src/audio_format.cpp
+    src/autostart.cpp
     src/config.cpp
     src/console.cpp
     src/device_registry.cpp
@@ -35,7 +36,9 @@ add_executable(vcmic
     src/logging.cpp
     src/paths.cpp
     src/sample_convert.cpp
+    src/session.cpp
     src/strings.cpp
+    src/tray.cpp
 )
 
 target_include_directories(vcmic PRIVATE src)
@@ -46,6 +49,12 @@ target_compile_definitions(vcmic PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
     STRICT
+    # Pinned rather than left to the toolchain: NOTIFYICON_VERSION_4 and the
+    # Task Scheduler 2.0 interfaces are both gated on this, and a mingw default
+    # of Windows 2000 hides them.
+    _WIN32_WINNT=0x0A00
+    WINVER=0x0A00
+    NTDDI_VERSION=0x0A000000
 )
 
 if(MSVC)
@@ -66,9 +75,16 @@ if(MINGW)
     target_link_options(vcmic PRIVATE -municode)
 endif()
 
-# ole32  : COM, CoTaskMemFree, PropVariantClear
-# avrt   : AvSetMmThreadCharacteristics (MMCSS "Pro Audio" scheduling)
-target_link_libraries(vcmic PRIVATE ole32 avrt)
+# ole32    : COM, CoTaskMemFree, PropVariantClear
+# oleaut32 : BSTR and VARIANT, for the Task Scheduler interfaces
+# avrt     : AvSetMmThreadCharacteristics (MMCSS "Pro Audio" scheduling)
+# taskschd : ITaskService, the logon task behind --install-autostart
+# secur32  : GetUserNameEx, to name the account that task belongs to
+# user32   : the hidden window that owns the tray icon
+# gdi32    : the icon itself, drawn at runtime rather than shipped as a resource
+# shell32  : Shell_NotifyIcon, ShellExecute
+target_link_libraries(vcmic PRIVATE
+    ole32 oleaut32 avrt taskschd secur32 user32 gdi32 shell32)
 
 set_target_properties(vcmic PROPERTIES
     OUTPUT_NAME "vcmic"
